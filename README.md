@@ -1,5 +1,7 @@
 # EQ Log Suite
 
+[![GitHub repo](https://img.shields.io/badge/GitHub-eq--log--suite-blue?logo=github)](https://github.com/mdjthesecond-droid/eq-log-suite)
+
 Personal EverQuest-family log parser: full combat breakdown into MySQL/MariaDB,
 browsable/filterable through a web UI (raw SQL or point-and-click), a live
 in-game overlay, and user-editable alert rules. Multi-game by design -- one
