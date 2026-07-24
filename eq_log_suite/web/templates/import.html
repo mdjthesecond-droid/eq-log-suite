@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}Import{% endblock %}
+{% block content %}
+<h1>Import a log file</h1>
+
+<p>New/rotated log files (new character, new server, EQ2 <code>/log</code> toggles) are picked up
+automatically every 5 minutes by the tailer -- this button skips the wait and tells it to check
+right now.</p>
+<form method="post" action="/import/rescan">
+  <button type="submit">Rescan log folders now</button>
+</form>
+
+<form method="post" action="/import">
+  <input name="path" placeholder="/home/myself/eql/Logs/eqlog_Cheerful_rivervale.txt" style="width:500px" required>
+  <select name="game">
+    <option value="auto">auto-detect</option>
+    <option value="eql">eql</option>
+    <option value="eq2">eq2</option>
+  </select>
+  <input name="character" placeholder="character (optional, guessed from filename)">
+  <input name="server" placeholder="server (optional, guessed from filename)">
+  <label><input type="checkbox" name="live" value="true"> mark for live tailing</label>
+  <button type="submit">Import</button>
+</form>
+
+{% if result %}
+<h2>Result (exit {{ result.returncode }})</h2>
+<pre>{{ result.stdout }}{{ result.stderr }}</pre>
+{% endif %}
+
+<h2>Known log sources</h2>
+<table class="sortable">
+  <thead><tr><th>id</th><th>file_path</th><th>last_byte_offset</th><th>last_parsed_at</th><th>live</th></tr></thead>
+  <tbody>
+    {% for s in sources %}
+    <tr><td>{{ s.id }}</td><td>{{ s.file_path }}</td><td>{{ s.last_byte_offset }}</td><td>{{ s.last_parsed_at }}</td><td>{{ s.live }}</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

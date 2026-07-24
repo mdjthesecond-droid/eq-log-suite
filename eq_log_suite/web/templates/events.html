@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Browse Events{% endblock %}
+{% block content %}
+<h1>Browse Events</h1>
+<form method="get" action="/events">
+  <input name="game" placeholder="game (eql/eq2)" value="{{ filters.game }}">
+  <input name="character" placeholder="character" value="{{ filters.character }}">
+  <input name="event_type" placeholder="event_type" value="{{ filters.event_type }}">
+  <input name="source" placeholder="source contains" value="{{ filters.source }}">
+  <input name="target" placeholder="target contains" value="{{ filters.target }}">
+  <input name="verb" placeholder="verb contains" value="{{ filters.verb }}">
+  <input name="outcome" placeholder="outcome" value="{{ filters.outcome }}">
+  <input name="since" placeholder="since YYYY-MM-DD HH:MM:SS" value="{{ filters.since }}">
+  <input name="until" placeholder="until" value="{{ filters.until }}">
+  <input name="limit" type="number" value="{{ filters.limit }}">
+  <button type="submit">Filter</button>
+</form>
+<details><summary>View as SQL</summary><pre>{{ sql }}</pre></details>
+<input type="text" data-filter-for="events-results" placeholder="quick filter (client-side, current page only)...">
+<p>{{ rows|length }} rows</p>
+<div style="overflow-x:auto">
+<table class="sortable" id="events-results">
+  <thead><tr>{% for c in columns %}<th{% if c == 'raw_line' %} class="col-raw-line"{% endif %}>{{ c }}</th>{% endfor %}</tr></thead>
+  <tbody>
+    {% for row in rows %}
+    <tr>{% for c in columns %}<td{% if c == 'raw_line' %} class="col-raw-line"{% endif %}>{{ row[c] if row[c] is not none else '' }}</td>{% endfor %}</tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endblock %}

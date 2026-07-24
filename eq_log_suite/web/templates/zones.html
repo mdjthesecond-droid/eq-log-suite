@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}Zones -- {{ game_label }}{% endblock %}
+{% block content %}
+<h1>Zones -- {{ game_label }}</h1>
+<p>One row per zone visit (the span between one "entered X" and your next zone change). Combat
+stats are whatever damage/kills/melee swings from you fall inside that window. A blank "left at"
+means that's the zone you're currently in.</p>
+
+<form method="get" action="/zones/{{ game }}">
+  <input name="character" placeholder="character" value="{{ filters.character }}">
+  <button type="submit">Filter</button>
+</form>
+
+{% if not rows %}
+<p>No zone data yet{% if filters.character %} matching those filters{% endif %}.</p>
+{% endif %}
+
+<div style="overflow-x:auto">
+<table class="sortable">
+  <thead>
+    <tr>
+      <th>character</th><th>zone</th><th>entered at</th><th>left at</th><th>duration (s)</th>
+      <th>first fight</th><th>last fight</th><th>total dmg</th><th>dps</th><th>kills</th>
+      <th>hit %</th><th>crit %</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for r in rows %}
+    <tr>
+      <td>{{ r.character_name }}</td>
+      <td>{{ r.zone }}</td>
+      <td>{{ r.entered_at }}</td>
+      <td>{{ r.left_at if r.left_at is not none else '' }}</td>
+      <td>{{ r.duration_s if r.duration_s is not none else '' }}</td>
+      <td>{{ r.first_fight_at if r.first_fight_at is not none else '' }}</td>
+      <td>{{ r.last_fight_at if r.last_fight_at is not none else '' }}</td>
+      <td>{{ r.total_damage }}</td>
+      <td>{{ r.dps if r.dps is not none else '' }}</td>
+      <td>{{ r.kills }}</td>
+      <td>{{ r.hit_pct if r.hit_pct is not none else '' }}</td>
+      <td>{{ r.crit_pct if r.crit_pct is not none else '' }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endblock %}

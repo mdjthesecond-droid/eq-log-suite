@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}Quests -- {{ game_label }}{% endblock %}
+{% block content %}
+<h1>Quests -- {{ game_label }}</h1>
+<p>Quest completions, with zone and NPC filled in by correlation -- the completion line itself
+doesn't state either. zone is whatever zone_change happened most recently before it; npc is the
+most recently hailed NPC before it (best-effort -- quest chains can involve hailing several NPCs
+before the actual turn-in, so this isn't a guaranteed turn-in target). Both blank means it
+completed before any zone_change/hail had been logged yet.</p>
+
+<form method="get" action="/quests/{{ game }}">
+  <input name="character" placeholder="character" value="{{ filters.character }}">
+  <input name="quest" placeholder="quest contains" value="{{ filters.quest }}">
+  <input name="zone" placeholder="zone contains" value="{{ filters.zone }}">
+  <input name="npc" placeholder="npc contains" value="{{ filters.npc }}">
+  <button type="submit">Filter</button>
+</form>
+
+{% if unresolved_zone_starts %}
+<div style="border:1px solid #c9a227; border-radius:6px; padding:0.8rem 1rem; margin-bottom:1rem;">
+  <strong>&#9888; {{ unresolved_zone_starts|length }} character(s) have activity logged before their
+  first zone was ever recorded -- confirm what zone they actually started in:</strong>
+  {% for u in unresolved_zone_starts %}
+  <form method="post" action="/zone-start/set" style="display:flex; gap:0.5rem; align-items:center; margin-top:0.5rem;">
+    <input type="hidden" name="character_id" value="{{ u.character_id }}">
+    <input type="hidden" name="next" value="/quests/{{ game }}">
+    <span style="min-width:220px;">{{ u.character_name }} <span style="opacity:0.7;">(earliest: {{ u.earliest_ts }})</span></span>
+    <input name="zone" placeholder="actual zone, e.g. The Steamfont Mountains" required style="width:280px;">
+    <input name="note" placeholder="note (optional)">
+    <button type="submit">Confirm</button>
+  </form>
+  {% endfor %}
+</div>
+{% endif %}
+
+{% if not rows %}
+<p>No quest completions yet{% if filters.character or filters.quest or filters.zone or filters.npc %} matching those filters{% endif %}.</p>
+{% endif %}
+
+<div style="overflow-x:auto">
+<table class="sortable">
+  <thead>
+    <tr><th>ts</th><th>character</th><th>quest</th><th>zone</th><th>npc</th><th>reward</th></tr>
+  </thead>
+  <tbody>
+    {% for r in rows %}
+    <tr>
+      <td>{{ r.ts }}</td>
+      <td>{{ r.character_name }}</td>
+      <td>{{ r.quest }}</td>
+      <td>{{ r.zone or '' }}</td>
+      <td>{{ r.npc or '' }}</td>
+      <td>{{ r.reward or '' }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endblock %}

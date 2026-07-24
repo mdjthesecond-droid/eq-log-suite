@@ -1,0 +1,234 @@
+{% extends "base.html" %}
+{% block title %}Live{% endblock %}
+{% block content %}
+<h1>Live</h1>
+
+<div id="zone-box" style="padding:0.5rem 1rem; border:1px solid var(--border); border-radius:6px; margin-bottom:0.6rem; font-size:1.1rem;">
+  Current zone: <span id="zone-value" style="font-weight:700;">{{ current_zone or '(unknown -- no zone_change recorded yet)' }}</span>
+</div>
+
+<h2>Active Encounter</h2>
+<div id="active-box" style="padding:0.8rem 1rem; border:1px solid var(--border); border-radius:6px; margin-bottom:1.5rem;">
+  <div style="display:flex; gap:1.5rem; align-items:baseline; font-size:1.4rem; margin-bottom:0.6rem;">
+    <span id="active-dps" style="font-weight:700;">DPS --</span>
+    <span id="active-hit" style="font-size:1rem;">Hit --</span>
+    <span id="active-crit" style="font-size:1rem;">Crit --</span>
+    <span id="active-damage" style="opacity:0.8; font-size:1rem;"></span>
+    <span id="active-state" style="opacity:0.7; font-size:0.9rem;"></span>
+  </div>
+  <table id="active-mobs-table" class="sortable">
+    <thead>
+      <tr>
+        <th>mob</th><th>dmg out</th><th>dps out</th><th>dmg in</th><th>dps in</th>
+        <th>my hit%</th><th>my crit%</th><th>their hit%</th><th>their crit%</th>
+      </tr>
+    </thead>
+    <tbody id="active-mobs-body"></tbody>
+  </table>
+  <p id="active-empty" style="opacity:0.7;">No combat yet this session.</p>
+</div>
+
+<h2>Previous Encounters</h2>
+<p style="opacity:0.7; font-size:0.9rem;">Last 40. For full history -- a whole day, or an
+imported log -- see <a href="/encounters">Encounters</a>.</p>
+<div id="encounters-list"></div>
+
+<script>
+  let lastId = {{ start_id }};
+
+  // ---- Active encounter boundaries mirror the server-side rule in
+  // _derive_gap_based_encounters(): EQ2 has explicit "You start/stop
+  // fighting." (combat_state) markers, used directly. EQL has none, so a
+  // combat action auto-opens an encounter if one isn't already active, and
+  // it closes on a hard stop (your death, escape, zone change) or after
+  // EQL_OUT_OF_COMBAT_SECONDS of no further action. Applying the same
+  // hard-stop/timeout rule to EQ2 too is harmless -- its explicit stop event
+  // always arrives well before either would fire during real combat.
+  const EQL_OUT_OF_COMBAT_SECONDS = 5;
+  const DAMAGE_EVENT_TYPES = new Set(["melee", "spell_damage", "ability_damage"]);
+  const enc = { active: false, startTs: null, lastTs: null, damageOut: 0, damageIn: 0,
+                swings: 0, landed: 0, crits: 0, mobs: {} };
+
+  function mobRow(name) {
+    if (!enc.mobs[name]) {
+      enc.mobs[name] = { mob: name, damageOut: 0, damageIn: 0,
+        swings: 0, landed: 0, crits: 0, theirSwings: 0, theirLanded: 0, theirCrits: 0 };
+    }
+    return enc.mobs[name];
+  }
+
+  function startEncounter(now) {
+    enc.active = true;
+    enc.startTs = now;
+    enc.lastTs = now;
+    enc.damageOut = 0; enc.damageIn = 0;
+    enc.swings = 0; enc.landed = 0; enc.crits = 0;
+    enc.mobs = {};
+  }
+
+  function stopEncounter(now) {
+    enc.active = false;
+    enc.lastTs = now;
+  }
+
+  function recordEvent(e) {
+    if (!DAMAGE_EVENT_TYPES.has(e.event_type)) return;
+    const now = Date.now();
+    if (!enc.active) startEncounter(now);  // EQL: a combat action opens the encounter
+    enc.lastTs = now;
+
+    if (e.source_type === "you" && e.target_name) {
+      const row = mobRow(e.target_name);
+      if (e.amount != null) { enc.damageOut += e.amount; row.damageOut += e.amount; }
+      if (e.event_type === "melee") {
+        enc.swings += 1; row.swings += 1;
+        if (e.outcome === "hit" || e.outcome === "crit") { enc.landed += 1; row.landed += 1; }
+        if (e.outcome === "crit") { enc.crits += 1; row.crits += 1; }
+      }
+    }
+    // "you" as target_type marks incoming damage regardless of who's tracked as source
+    if (e.target_type === "you" && e.source_name) {
+      const row = mobRow(e.source_name);
+      if (e.amount != null) { enc.damageIn += e.amount; row.damageIn += e.amount; }
+      if (e.event_type === "melee") {
+        row.theirSwings += 1;
+        if (e.outcome === "hit" || e.outcome === "crit") row.theirLanded += 1;
+        if (e.outcome === "crit") row.theirCrits += 1;
+      }
+    }
+  }
+
+  function pct(num, den) { return den ? Math.round((num / den) * 100) : null; }
+  function fmtPct(p) { return p === null ? "--" : p + "%"; }
+
+  function renderActive() {
+    const now = Date.now();
+    const hasData = enc.startTs !== null;
+    document.getElementById("active-empty").style.display = hasData ? "none" : "";
+    document.getElementById("active-mobs-table").style.display = hasData ? "" : "none";
+    if (!hasData) {
+      document.getElementById("active-dps").textContent = "DPS --";
+      document.getElementById("active-hit").textContent = "Hit --";
+      document.getElementById("active-crit").textContent = "Crit --";
+      document.getElementById("active-damage").textContent = "";
+      document.getElementById("active-state").textContent = "";
+      return;
+    }
+    const end = enc.active ? now : enc.lastTs;
+    const elapsedS = Math.max((end - enc.startTs) / 1000, 0.1);
+    const dps = Math.round(enc.damageOut / elapsedS);
+    document.getElementById("active-dps").textContent = `DPS ${dps.toLocaleString()}`;
+    document.getElementById("active-hit").textContent = `Hit ${fmtPct(pct(enc.landed, enc.swings))}`;
+    document.getElementById("active-crit").textContent = `Crit ${fmtPct(pct(enc.crits, enc.landed))}`;
+    document.getElementById("active-damage").textContent =
+      `${enc.damageOut.toLocaleString()} out / ${enc.damageIn.toLocaleString()} in dmg -- ${elapsedS.toFixed(0)}s`;
+    document.getElementById("active-state").textContent = enc.active ? "" : "(stopped)";
+    document.getElementById("active-box").style.opacity = enc.active ? "1" : "0.6";
+
+    const tbody = document.getElementById("active-mobs-body");
+    tbody.innerHTML = "";
+    const rows = Object.values(enc.mobs).sort((a, b) => b.damageOut - a.damageOut);
+    for (const r of rows) {
+      const tr = document.createElement("tr");
+      const dpsOut = (r.damageOut / elapsedS).toFixed(1);
+      const dpsIn = (r.damageIn / elapsedS).toFixed(1);
+      tr.innerHTML = `<td>${r.mob}</td><td>${r.damageOut.toLocaleString()}</td><td>${dpsOut}</td>` +
+        `<td>${r.damageIn.toLocaleString()}</td><td>${dpsIn}</td>` +
+        `<td>${fmtPct(pct(r.landed, r.swings))}</td><td>${fmtPct(pct(r.crits, r.landed))}</td>` +
+        `<td>${fmtPct(pct(r.theirLanded, r.theirSwings))}</td><td>${fmtPct(pct(r.theirCrits, r.theirLanded))}</td>`;
+      tbody.appendChild(tr);
+    }
+  }
+
+  async function poll() {
+    const res = await fetch(`/api/events/since/${lastId}`);
+    const events = await res.json();
+    for (const e of events) {
+      lastId = e.id;
+      if (e.source_type === "you" && e.event_type === "zone_change" && e.target_name) {
+        document.getElementById("zone-value").textContent = e.target_name;
+      }
+      if (e.event_type === "combat_state" && e.source_type === "you") {
+        if (e.verb === "start") startEncounter(Date.now());
+        else if (e.verb === "stop") stopEncounter(Date.now());
+      }
+      // EQL hard stops: your death, escape, or a zone change end the
+      // encounter immediately, same as the server-side is_hard_stop rows.
+      const isHardStop =
+        (e.event_type === "death" && e.target_type === "you") ||
+        e.event_type === "escape" ||
+        (e.event_type === "zone_change" && e.source_type === "you");
+      if (isHardStop && enc.active) stopEncounter(Date.now());
+      recordEvent(e);
+    }
+    // EQL soft stop: no combat action in EQL_OUT_OF_COMBAT_SECONDS closes
+    // the encounter at the last action's timestamp (not "now").
+    if (enc.active && (Date.now() - enc.lastTs) / 1000 > EQL_OUT_OF_COMBAT_SECONDS) {
+      stopEncounter(enc.lastTs);
+    }
+  }
+
+  // ---- Previous encounters: server-computed list + on-demand per-mob detail.
+  const loadedDetails = new Set();
+
+  function fmtTs(iso) {
+    return iso.replace("T", " ");
+  }
+
+  async function loadEncounters() {
+    const res = await fetch("/api/encounters?limit=40");
+    const encounters = await res.json();
+    const container = document.getElementById("encounters-list");
+    container.innerHTML = "";
+    for (const e of encounters) {
+      if (e.active) continue;  // shown in the Active Encounter box instead
+      const details = document.createElement("details");
+      const key = `${e.character}|${e.start_ts}|${e.stop_ts}`;
+      const summary = document.createElement("summary");
+      const mobLabel = e.first_mob
+        ? e.first_mob + (e.mob_count > 1 ? ` (+${e.mob_count - 1} more, ${e.mob_count} mobs total)` : "")
+        : "(no mob interaction)";
+      summary.textContent =
+        `${mobLabel} -- ${e.duration_s}s -- ${fmtTs(e.start_ts)} | ${e.character} | ` +
+        `DPS ${e.dps_out} | ${Math.round(e.damage_out)} out / ${Math.round(e.damage_in)} in dmg | ` +
+        `Hit ${fmtPct(e.hit_pct)} Crit ${fmtPct(e.crit_pct)} | ${e.kills} kill(s)`;
+      details.appendChild(summary);
+      const body = document.createElement("div");
+      body.style.padding = "0.5rem 0 0.5rem 1rem";
+      body.textContent = "Loading...";
+      details.appendChild(body);
+      details.addEventListener("toggle", async () => {
+        if (!details.open || loadedDetails.has(key)) return;
+        loadedDetails.add(key);
+        const params = new URLSearchParams({ character: e.character, start_ts: e.start_ts, stop_ts: e.stop_ts });
+        const detailRes = await fetch(`/api/encounters/detail?${params}`);
+        const mobs = await detailRes.json();
+        if (!mobs.length) {
+          body.textContent = "No per-mob data.";
+          return;
+        }
+        const table = document.createElement("table");
+        table.innerHTML = "<thead><tr><th>mob</th><th>dmg out</th><th>dmg in</th>" +
+          "<th>my hit%</th><th>my crit%</th><th>their hit%</th><th>their crit%</th>" +
+          "<th>my evasion%</th><th>their resist%</th><th>my DS dmg</th><th>their DS dmg</th></tr></thead>" +
+          "<tbody>" + mobs.map(m =>
+            `<tr><td>${m.mob}</td><td>${m.damage_out.toLocaleString()}</td><td>${m.damage_in.toLocaleString()}</td>` +
+            `<td>${fmtPct(m.hit_pct)}</td><td>${fmtPct(m.crit_pct)}</td>` +
+            `<td>${fmtPct(m.their_hit_pct)}</td><td>${fmtPct(m.their_crit_pct)}</td>` +
+            `<td>${fmtPct(m.evasion_pct)}</td><td>${fmtPct(m.resist_pct)}</td>` +
+            `<td>${m.ds_out.toLocaleString()}</td><td>${m.ds_in.toLocaleString()}</td></tr>`
+          ).join("") + "</tbody>";
+        body.innerHTML = "";
+        body.appendChild(table);
+      });
+      container.appendChild(details);
+    }
+  }
+
+  setInterval(poll, 1000);
+  setInterval(renderActive, 250);
+  setInterval(loadEncounters, 10000);
+  poll();
+  loadEncounters();
+</script>
+{% endblock %}

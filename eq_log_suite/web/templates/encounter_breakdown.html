@@ -1,0 +1,174 @@
+{% extends "base.html" %}
+{% block title %}Encounter Breakdown{% endblock %}
+{% block content %}
+<h1>Encounter Breakdown</h1>
+<p>{{ filters.character }} -- {{ start_ts.replace("T", " ") }} to {{ stop_ts.replace("T", " ") }}
+-- {{ duration_s }}s total duration</p>
+
+{% if not npcs %}
+<p>No combat data for this window.</p>
+{% endif %}
+
+{% macro attack_table(rows) %}
+<div style="overflow-x:auto">
+<table class="sortable">
+  <thead>
+    <tr>
+      <th>attack</th><th>total dmg</th><th>attempts</th><th>hit %</th><th>crit %</th><th>miss %</th>
+      <th>dodged %</th><th>parried %</th><th>blocked %</th><th>riposted %</th><th>resisted %</th>
+      <th>min dmg (hit)</th><th>avg dmg (hit)</th><th>max dmg (hit)</th>
+      <th>min dmg (crit)</th><th>avg dmg (crit)</th><th>max dmg (crit)</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for r in rows %}
+    <tr>
+      <td>{{ r.verb }}</td>
+      <td>{{ r.total_damage }}</td>
+      <td>{{ r.attempts }}</td>
+      <td>{{ r.hit_pct if r.hit_pct is not none else '' }}</td>
+      <td>{{ r.crit_pct if r.crit_pct is not none else '' }}</td>
+      <td>{{ r.miss_pct if r.miss_pct is not none else '' }}</td>
+      <td>{{ r.dodge_pct if r.dodge_pct is not none else '' }}</td>
+      <td>{{ r.parry_pct if r.parry_pct is not none else '' }}</td>
+      <td>{{ r.block_pct if r.block_pct is not none else '' }}</td>
+      <td>{{ r.riposte_pct if r.riposte_pct is not none else '' }}</td>
+      <td>{{ r.resist_pct if r.resist_pct is not none else '' }}</td>
+      <td>{{ r.min_hit if r.min_hit is not none else '' }}</td>
+      <td>{{ r.avg_hit if r.avg_hit is not none else '' }}</td>
+      <td>{{ r.max_hit if r.max_hit is not none else '' }}</td>
+      <td>{{ r.min_crit if r.min_crit is not none else '' }}</td>
+      <td>{{ r.avg_crit if r.avg_crit is not none else '' }}</td>
+      <td>{{ r.max_crit if r.max_crit is not none else '' }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endmacro %}
+
+{% for n in npcs %}
+<div style="border:1px solid var(--border); border-radius:6px; padding:0.8rem 1rem; margin-bottom:1.5rem;">
+
+  <h2 style="margin-top:0;">{{ n.npc }}</h2>
+  <p style="opacity:0.8;">{{ start_ts.replace("T", " ") }} to {{ stop_ts.replace("T", " ") }} -- {{ duration_s }}s total duration</p>
+  <table style="margin-bottom:1rem;">
+    <tr><td style="opacity:0.7; padding-right:1rem;">damage done <strong>to</strong> {{ n.npc }}</td>
+        <td>melee: {{ n.melee_damage_to }}</td><td>spell: {{ n.spell_damage_to }}</td>
+        <td>total: {{ n.melee_damage_to + n.spell_damage_to }}</td></tr>
+    <tr><td style="opacity:0.7; padding-right:1rem;">damage done <strong>by</strong> {{ n.npc }} (to the group)</td>
+        <td>melee: {{ n.melee_damage_from }}</td><td>spell: {{ n.spell_damage_from }}</td>
+        <td>total: {{ n.melee_damage_from + n.spell_damage_from }}</td></tr>
+  </table>
+
+  <h3>You</h3>
+  {% if n.you.out %}
+  <h4>Outgoing (You &rarr; {{ n.npc }}) -- {{ n.you.out_total }} total damage in {{ duration_s }}s ({{ n.you.out_dps }} dps)</h4>
+  {{ attack_table(n.you.out) }}
+  {% endif %}
+  {% if n.you['in'] %}
+  <h4>Incoming ({{ n.npc }} &rarr; You) -- {{ n.you.in_total }} total damage in {{ duration_s }}s ({{ n.you.in_dps }} dps)</h4>
+  {{ attack_table(n.you['in']) }}
+  {% endif %}
+  {% if not n.you.out and not n.you['in'] %}
+  <p style="opacity:0.7;">No direct combat with {{ n.npc }}.</p>
+  {% endif %}
+
+  {% if n.others %}
+  <h3>Everyone else</h3>
+  <div class="others-block" data-npc="{{ n.npc }}">
+    <button type="button" class="expand-all" style="margin-bottom:0.4rem;">expand all</button>
+    <div style="overflow-x:auto">
+    <table class="others-summary">
+      <thead>
+        <tr><th>combatant</th><th>dmg out</th><th>dps out</th><th>dmg in</th><th>dps in</th><th></th></tr>
+      </thead>
+      <tbody>
+        {% for o in n.others %}
+        <tr class="others-summary-row">
+          <td>{{ o.combatant }}</td>
+          <td>{{ o.out_total }}</td>
+          <td>{{ o.out_dps }}</td>
+          <td>{{ o.in_total }}</td>
+          <td>{{ o.in_dps }}</td>
+          <td><button type="button" class="expand-one">expand</button></td>
+        </tr>
+        <tr class="others-detail-row" style="display:none;">
+          <td colspan="6">
+            {% if o.out %}
+            <h4>Outgoing ({{ o.combatant }} &rarr; {{ n.npc }})</h4>
+            {{ attack_table(o.out) }}
+            {% endif %}
+            {% if o['in'] %}
+            <h4>Incoming ({{ n.npc }} &rarr; {{ o.combatant }})</h4>
+            {{ attack_table(o['in']) }}
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </div>
+  {% endif %}
+
+</div>
+{% endfor %}
+
+<script>
+  // Summary rows are paired 1:1 with a hidden detail row right after them
+  // (for expand/collapse) -- the generic table.js sorter would sort every
+  // <tr> independently and scramble that pairing, so this table skips
+  // class="sortable" and gets its own sorter that always moves both rows
+  // of a pair together.
+  function makeSortablePaired(table) {
+    const headers = table.querySelectorAll("thead th");
+    headers.forEach((th, idx) => {
+      if (!th.textContent.trim()) return;
+      th.style.cursor = "pointer";
+      th.addEventListener("click", () => {
+        const tbody = table.querySelector("tbody");
+        const summaryRows = Array.from(tbody.querySelectorAll(".others-summary-row"));
+        const asc = th.dataset.sortDir !== "asc";
+        headers.forEach((h) => delete h.dataset.sortDir);
+        th.dataset.sortDir = asc ? "asc" : "desc";
+        summaryRows.sort((a, b) => {
+          const av = a.children[idx].textContent.trim();
+          const bv = b.children[idx].textContent.trim();
+          const an = parseFloat(av), bn = parseFloat(bv);
+          const cmp = (!isNaN(an) && !isNaN(bn) && av !== "" && bv !== "") ? an - bn : av.localeCompare(bv);
+          return asc ? cmp : -cmp;
+        });
+        summaryRows.forEach((row) => {
+          const detail = row.nextElementSibling;
+          tbody.appendChild(row);
+          tbody.appendChild(detail);
+        });
+      });
+    });
+  }
+  document.querySelectorAll(".others-summary").forEach(makeSortablePaired);
+
+  document.querySelectorAll(".others-block").forEach((block) => {
+    const expandAllBtn = block.querySelector(".expand-all");
+    const detailRows = block.querySelectorAll(".others-detail-row");
+    let allExpanded = false;
+
+    block.querySelectorAll(".expand-one").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const row = btn.closest("tr").nextElementSibling;
+        const opening = row.style.display === "none";
+        row.style.display = opening ? "" : "none";
+        btn.textContent = opening ? "collapse" : "expand";
+      });
+    });
+
+    expandAllBtn.addEventListener("click", () => {
+      allExpanded = !allExpanded;
+      detailRows.forEach((row) => { row.style.display = allExpanded ? "" : "none"; });
+      block.querySelectorAll(".expand-one").forEach((btn) => { btn.textContent = allExpanded ? "collapse" : "expand"; });
+      expandAllBtn.textContent = allExpanded ? "collapse all" : "expand all";
+    });
+  });
+</script>
+{% endblock %}

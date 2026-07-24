@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}SQL Query{% endblock %}
+{% block content %}
+<h1>SQL Query</h1>
+<form method="post" action="/query">
+  <textarea name="sql" rows="6" style="width:100%">{{ sql }}</textarea>
+  <button type="submit">Run</button>
+</form>
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+{% if rows %}
+<p>{{ rows|length }} rows</p>
+<div style="overflow-x:auto">
+<table class="sortable" id="query-results">
+  <thead><tr>{% for c in columns %}<th>{{ c }}</th>{% endfor %}</tr></thead>
+  <tbody>
+    {% for row in rows %}
+    <tr>{% for c in columns %}<td>{{ row[c] if row[c] is not none else '' }}</td>{% endfor %}</tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endif %}
+{% endblock %}

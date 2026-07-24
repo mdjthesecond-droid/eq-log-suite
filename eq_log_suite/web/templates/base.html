@@ -1,0 +1,28 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>{% block title %}EQ Log Suite{% endblock %}</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/table.js" defer></script>
+</head>
+<body>
+  <nav>
+    <a href="/">Home</a>
+    <a href="/live">Live</a>
+    <span class="nav-divider"></span>
+    <a href="/encounters">Encounters</a>
+    <span class="nav-divider"></span>
+    <a href="/eql">EQ Legends</a>
+    <a href="/eq2">EverQuest II</a>
+    <a href="/events">Browse Events</a>
+    <a href="/query">SQL Query</a>
+    <span class="nav-divider"></span>
+    <a href="/import">Import</a>
+    <a href="/alerts">Alerts</a>
+  </nav>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

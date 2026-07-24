@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}{{ game_label }}{% endblock %}
+{% block content %}
+<h1>{{ game_label }}</h1>
+<p>Reports scoped to just this game.</p>
+
+<ul>
+  <li><a href="/loot/{{ game }}">Loot</a> -- drop table per NPC killed: item, zone, quantity, chance% (drops / kills, not just a drop count).</li>
+  <li><a href="/gathering/{{ game }}">Gathering</a> -- loot table per node: item, zone, drop chance, avg/total quantity, rare rate.</li>
+  <li><a href="/attacks/{{ game }}">Attacks</a> -- per-attack (melee verb or spell) breakdown: hit/crit rate, evasion, resist rate, min/avg/max damage split by hit vs crit.</li>
+  <li><a href="/zones/{{ game }}">Zones</a> -- one row per zone visit: entered/left timestamps, first/last fight, total damage, DPS, kills, hit%/crit%.</li>
+  <li><a href="/quests/{{ game }}">Quests</a> -- completions with zone and NPC filled in by correlation, plus reward.</li>
+</ul>
+
+<p><a href="/">&larr; Back to Home</a> for reports that aren't split by game (encounters, browse events, SQL query).</p>
+{% endblock %}

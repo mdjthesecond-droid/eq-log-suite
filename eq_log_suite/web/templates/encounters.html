@@ -1,0 +1,218 @@
+{% extends "base.html" %}
+{% block title %}Encounters{% endblock %}
+{% block content %}
+<h1>Encounters</h1>
+<p>Full encounter history (not just the live session) -- filter by character and/or a date range
+to work through a whole day or an entire imported log. See <a href="/live">Live</a> for the
+real-time "active encounter" view of the last 40. Each encounter is named after the first mob you
+engaged, since same-named mobs can't be told apart from log text alone, "mob" here just means
+"whichever name is on the other end of a combat line" -- so a duo partner's name can occasionally
+show up in the mob list too.</p>
+
+<h2>Pick a log</h2>
+<p style="opacity:0.8;">Click a log below to load its full date range, or set your own filters.
+A log/date range is required before anything queries -- an unbounded fetch here means pulling
+every combat event in the database into Python first, which stops scaling once there's more than
+a few weeks of history.</p>
+<div style="overflow-x:auto">
+<table class="sortable">
+  <thead>
+    <tr>
+      <th>character</th><th>game</th><th>file</th><th>events</th>
+      <th>first event</th><th>last event</th><th>file last modified</th><th>live</th><th></th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for log in known_logs %}
+    <tr>
+      <td>{{ log.character_name }}</td>
+      <td>{{ log.game }}</td>
+      <td style="font-size:0.85rem;">{{ log.file_path }}</td>
+      <td>{{ log.event_count }}</td>
+      <td>{{ log.first_event_ts if log.first_event_ts is not none else '' }}</td>
+      <td>{{ log.last_event_ts if log.last_event_ts is not none else '' }}</td>
+      <td>{{ log.file_mtime if log.file_mtime is not none else '(file not found)' }}</td>
+      <td>{{ 'yes' if log.live else '' }}</td>
+      <td>
+        {% if log.first_event_ts and log.last_event_ts %}
+        <a href="/encounters?character={{ log.character_name }}&start_ts={{ log.first_event_ts.isoformat() }}&end_ts={{ log.last_event_ts.isoformat() }}">load full range</a>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+
+<h2>Filter</h2>
+<form method="get" action="/encounters">
+  <input name="character" placeholder="character (required)" value="{{ filters.character }}" required>
+  <input name="start_ts" type="datetime-local" title="start (required)" value="{{ filters.start_ts }}" required>
+  <input name="end_ts" type="datetime-local" title="end (required)" value="{{ filters.end_ts }}" required>
+  <input name="limit" type="number" min="0" max="5000" title="max results (0 = unlimited)" value="{{ filters.limit }}" style="width:90px;">
+  <select name="order">
+    <option value="desc" {% if filters.order == 'desc' %}selected{% endif %}>newest first</option>
+    <option value="asc" {% if filters.order == 'asc' %}selected{% endif %}>oldest first</option>
+  </select>
+  <button type="submit">Filter</button>
+</form>
+
+{% if not ready %}
+<p style="opacity:0.8;">Pick a log above, or set character + start + end, to see encounters.</p>
+{% else %}
+<p style="opacity:0.8;">
+  {{ totals.count }} encounter(s) -- {{ totals.damage_out|round|int }} dmg out /
+  {{ totals.damage_in|round|int }} dmg in -- {{ totals.kills }} kill(s) --
+  {{ (totals.duration_s / 60)|round(1) }} min total in combat
+</p>
+{% if not encounters %}
+<p>No encounters matching those filters.</p>
+{% endif %}
+{% endif %}
+
+<div id="encounters-list">
+  {% for e in encounters %}
+  <details class="encounter-row" data-character="{{ e.character }}" data-start-ts="{{ e.start_ts }}" data-stop-ts="{{ e.stop_ts or '' }}">
+    <summary>
+      <strong>
+        {%- if e.first_mob -%}
+          {{ e.first_mob }}{% if e.mob_count > 1 %} (+{{ e.mob_count - 1 }} more, {{ e.mob_count }} mobs total){% endif %}
+        {%- else -%}
+          (no mob interaction)
+        {%- endif -%}
+      </strong>
+      -- {{ e.duration_s }}s -- {{ e.start_ts.replace("T", " ") }}
+      | {{ e.character }} ({{ e.game }}) |
+      DPS {{ e.dps_out }} | {{ e.damage_out|round|int }} out / {{ e.damage_in|round|int }} in dmg |
+      Hit {{ (e.hit_pct ~ '%') if e.hit_pct is not none else '--' }}
+      Crit {{ (e.crit_pct ~ '%') if e.crit_pct is not none else '--' }} |
+      {{ e.kills }} kill(s)
+    </summary>
+    <div class="encounter-detail" style="padding:0.5rem 0 0.5rem 1rem;">Loading...</div>
+  </details>
+  {% endfor %}
+</div>
+
+<script>
+  const loadedDetails = new Set();
+  function fmtPct(p) { return (p === null || p === undefined) ? "--" : p + "%"; }
+  function esc(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
+
+  function logBlock() {
+    const div = document.createElement("div");
+    div.style.cssText = "display:none; max-height:320px; overflow-y:auto; font-family:monospace; " +
+      "font-size:0.8rem; white-space:pre-wrap; background:#12141c; border:1px solid var(--border); " +
+      "border-radius:4px; padding:0.5rem; margin:0.4rem 0;";
+    div.textContent = "Loading...";
+    return div;
+  }
+
+  async function fetchLog(params) {
+    const res = await fetch(`/api/encounters/log?${new URLSearchParams(params)}`);
+    const rows = await res.json();
+    return rows.length ? rows.map(r => r.raw_line).join("\n") : "No log entries.";
+  }
+
+  // Toggle a lazy-loaded log block open/closed; fetches once, caches after.
+  function wireLogToggle(button, block, params) {
+    let loaded = false;
+    button.addEventListener("click", async () => {
+      const opening = block.style.display === "none";
+      block.style.display = opening ? "" : "none";
+      button.textContent = (opening ? "hide log" : "show log") + (button.dataset.label ? ` (${button.dataset.label})` : "");
+      if (opening && !loaded) {
+        loaded = true;
+        block.textContent = await fetchLog(params);
+      }
+    });
+  }
+
+  document.querySelectorAll(".encounter-row").forEach((details) => {
+    details.addEventListener("toggle", async () => {
+      const key = details.dataset.startTs + "|" + details.dataset.stopTs;
+      if (!details.open || loadedDetails.has(key)) return;
+      loadedDetails.add(key);
+      const body = details.querySelector(".encounter-detail");
+      const baseParams = {
+        character: details.dataset.character,
+        start_ts: details.dataset.startTs,
+        stop_ts: details.dataset.stopTs,
+      };
+      const res = await fetch(`/api/encounters/detail?${new URLSearchParams(baseParams)}`);
+      const mobs = await res.json();
+
+      body.innerHTML = "";
+
+      const fullLogBtn = document.createElement("button");
+      fullLogBtn.type = "button";
+      fullLogBtn.textContent = "show log";
+      fullLogBtn.style.marginBottom = "0.4rem";
+      const fullLogBlock = logBlock();
+      body.appendChild(fullLogBtn);
+      body.appendChild(fullLogBlock);
+      wireLogToggle(fullLogBtn, fullLogBlock, baseParams);
+
+      const breakdownLink = document.createElement("a");
+      breakdownLink.href = `/encounters/breakdown?${new URLSearchParams(baseParams)}`;
+      breakdownLink.target = "_blank";
+      breakdownLink.textContent = "full breakdown ↗";
+      breakdownLink.style.cssText = "display:inline-block; margin:0 0 0.4rem 0.8rem;";
+      body.appendChild(breakdownLink);
+
+      if (!mobs.length) {
+        const p = document.createElement("p");
+        p.textContent = "No per-mob data.";
+        body.appendChild(p);
+        return;
+      }
+
+      const table = document.createElement("table");
+      table.innerHTML = "<thead><tr><th>mob</th><th>dmg out</th><th>dmg in</th>" +
+        "<th>my hit%</th><th>my crit%</th><th>their hit%</th><th>their crit%</th>" +
+        "<th>my evasion%</th><th>their resist%</th><th>my DS dmg</th><th>their DS dmg</th>" +
+        "<th>contributors (dmg out)</th><th></th></tr></thead><tbody></tbody>";
+      const tbody = table.querySelector("tbody");
+
+      for (const m of mobs) {
+        const tr = document.createElement("tr");
+        const contribText = (m.contributors || [])
+          .map(c => `${esc(c.name)}: ${c.damage_out.toLocaleString()}`).join(", ");
+        tr.innerHTML = `<td>${esc(m.mob)}</td><td>${m.damage_out.toLocaleString()}</td><td>${m.damage_in.toLocaleString()}</td>` +
+          `<td>${fmtPct(m.hit_pct)}</td><td>${fmtPct(m.crit_pct)}</td>` +
+          `<td>${fmtPct(m.their_hit_pct)}</td><td>${fmtPct(m.their_crit_pct)}</td>` +
+          `<td>${fmtPct(m.evasion_pct)}</td><td>${fmtPct(m.resist_pct)}</td>` +
+          `<td>${m.ds_out.toLocaleString()}</td><td>${m.ds_in.toLocaleString()}</td>` +
+          `<td style="font-size:0.85rem;">${contribText}</td><td></td>`;
+        tbody.appendChild(tr);
+
+        const logRow = document.createElement("tr");
+        const logCell = document.createElement("td");
+        logCell.colSpan = 13;
+        const mobLogBlock = logBlock();
+        logCell.appendChild(mobLogBlock);
+        logRow.appendChild(logCell);
+        logRow.style.display = "none";
+        tbody.appendChild(logRow);
+
+        const mobLogBtn = document.createElement("button");
+        mobLogBtn.type = "button";
+        mobLogBtn.textContent = "log";
+        mobLogBtn.dataset.label = m.mob;
+        tr.lastElementChild.appendChild(mobLogBtn);
+        mobLogBtn.addEventListener("click", async () => {
+          const opening = logRow.style.display === "none";
+          logRow.style.display = opening ? "" : "none";
+          if (opening && mobLogBlock.textContent === "Loading...") {
+            mobLogBlock.style.display = "";
+            mobLogBlock.textContent = await fetchLog({ ...baseParams, mob: m.mob });
+          } else {
+            mobLogBlock.style.display = opening ? "" : "none";
+          }
+        });
+      }
+
+      body.appendChild(table);
+    });
+  });
+</script>
+{% endblock %}

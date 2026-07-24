@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}Alerts{% endblock %}
+{% block content %}
+<h1>Alert Rules</h1>
+<p>Rules are evaluated by the tailer against every live event. <code>field_condition</code> uses a
+small whitelisted mini-language: <code>field OP value (AND field OP value)*</code> over
+<code>event_type, source_name, source_type, target_name, target_type, verb, amount, outcome</code>
+-- e.g. <code>target_type=you AND amount&gt;200</code>.</p>
+<form method="post" action="/alerts/create">
+  <input name="name" placeholder="name" required>
+  <input name="description" placeholder="description">
+  <select name="game_id">
+    <option value="">All games</option>
+    {% for g in games %}<option value="{{ g.id }}">{{ g.code }}</option>{% endfor %}
+  </select>
+  <select name="match_type">
+    <option value="regex">regex (matches raw_line)</option>
+    <option value="field_condition">field_condition</option>
+  </select>
+  <input name="pattern" placeholder="pattern / condition" style="width:320px" required>
+  <label><input type="checkbox" name="reaction_types" value="notify"> notify</label>
+  <label><input type="checkbox" name="reaction_types" value="sound"> sound</label>
+  <label><input type="checkbox" name="reaction_types" value="overlay"> overlay</label>
+  <label><input type="checkbox" name="reaction_types" value="log" checked> log</label>
+  <input name="sound_file" placeholder="sound file path (if sound)">
+  <input name="overlay_text" placeholder="overlay text override (optional)">
+  <input name="cooldown_seconds" type="number" value="0" placeholder="cooldown (s)">
+  <button type="submit">Create</button>
+</form>
+
+<table class="sortable">
+  <thead>
+    <tr><th>id</th><th>name</th><th>game</th><th>match_type</th><th>pattern</th><th>reactions</th><th>cooldown</th><th>enabled</th><th></th></tr>
+  </thead>
+  <tbody>
+    {% for r in rules %}
+    <tr>
+      <td>{{ r.id }}</td><td>{{ r.name }}</td><td>{{ r.game_code or 'all' }}</td>
+      <td>{{ r.match_type }}</td><td>{{ r.pattern }}</td><td>{{ r.reaction_types }}</td>
+      <td>{{ r.cooldown_seconds }}</td><td>{{ 'yes' if r.enabled else 'no' }}</td>
+      <td>
+        <form method="post" action="/alerts/{{ r.id }}/toggle" style="display:inline"><button>toggle</button></form>
+        <form method="post" action="/alerts/{{ r.id }}/delete" style="display:inline"><button>delete</button></form>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<h2>Recent firings</h2>
+<table class="sortable">
+  <thead><tr><th>ts</th><th>rule</th><th>matched_text</th></tr></thead>
+  <tbody>
+    {% for l in log %}
+    <tr><td>{{ l.ts }}</td><td>{{ l.rule_name }}</td><td>{{ l.matched_text }}</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

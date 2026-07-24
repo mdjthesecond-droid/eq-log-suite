@@ -1,0 +1,119 @@
+{% extends "base.html" %}
+{% block title %}Gathering -- {{ game_label }}{% endblock %}
+{% block content %}
+<h1>Gathering -- {{ game_label }}</h1>
+<p>Loot table reconstructed from your own pulls. Each row is a distinct (item, quantity) outcome --
+gather yields come from fixed quantity tiers, not a random range, so e.g. "2x tuber strand" and
+"7x tuber strand" are tracked as separate outcomes with their own chance rather than averaged
+together. chance% is that exact outcome's share of all pulls from that node; rare is how many of
+those pulls were flagged "rare" by the game. tier is a one-time tag you assign per node below
+(the log doesn't state it); zone is just a hint -- the zone you were in for that pull.</p>
+
+<form method="get" action="/gathering/{{ game }}">
+  <input name="character" placeholder="character" value="{{ filters.character }}">
+  <input name="zone" placeholder="zone contains" value="{{ filters.zone }}">
+  <input name="node" placeholder="node contains" value="{{ filters.node }}">
+  <input name="item" placeholder="item contains" value="{{ filters.item }}">
+  <select name="skill">
+    <option value="">any skill</option>
+    {% for s in skills %}<option value="{{ s }}" {% if filters.skill == s %}selected{% endif %}>{{ s }}</option>{% endfor %}
+  </select>
+  <select name="era">
+    <option value="current" {% if selected_era == 'current' %}selected{% endif %}>current era</option>
+    <option value="all" {% if selected_era == 'all' %}selected{% endif %}>all eras (all-time)</option>
+    {% for e in eras %}
+    <option value="{{ e.id }}" {% if selected_era == e.id|string %}selected{% endif %}>
+      {{ e.name }} ({{ e.started_at }}{% if e.ended_at %} to {{ e.ended_at }}{% endif %})
+    </option>
+    {% endfor %}
+  </select>
+  <button type="submit">Filter</button>
+</form>
+
+<details style="margin-bottom:1rem;">
+  <summary>Start a new era (e.g. after a patch changes drop rates)</summary>
+  <p>Closes the current era right now and starts a new one. Nothing is deleted -- old data stays
+  fully queryable under its own era (pick it above, or "all eras" to see everything at once).</p>
+  <form method="post" action="/gathering/new-era">
+    <input type="hidden" name="game" value="{{ game }}">
+    <input name="name" placeholder="era name, e.g. Post Patch 7.2" required>
+    <input name="note" placeholder="note (optional)">
+    <button type="submit">Start new era</button>
+  </form>
+</details>
+
+{% if unidentified_nodes %}
+<div style="border:1px solid #c9a227; border-radius:6px; padding:0.8rem 1rem; margin-bottom:1rem;">
+  <strong>&#9888; {{ unidentified_nodes|length }} node(s) discovered with no tier assigned yet:</strong>
+  {% for n in unidentified_nodes %}
+  <form method="post" action="/gathering/set-tier" style="display:flex; gap:0.5rem; align-items:center; margin-top:0.5rem;">
+    <input type="hidden" name="node" value="{{ n }}">
+    <input type="hidden" name="game" value="{{ game }}">
+    <span style="min-width:220px;">{{ n }}</span>
+    <input name="tier" placeholder="tier, e.g. Tier 2 or T2" required style="width:140px;">
+    <input name="note" placeholder="note (optional)">
+    <button type="submit">Save</button>
+  </form>
+  {% endfor %}
+</div>
+{% endif %}
+
+{% if unresolved_zone_starts %}
+<div style="border:1px solid #c9a227; border-radius:6px; padding:0.8rem 1rem; margin-bottom:1rem;">
+  <strong>&#9888; {{ unresolved_zone_starts|length }} character(s) have activity logged before their
+  first zone was ever recorded -- confirm what zone they actually started in:</strong>
+  {% for u in unresolved_zone_starts %}
+  <form method="post" action="/zone-start/set" style="display:flex; gap:0.5rem; align-items:center; margin-top:0.5rem;">
+    <input type="hidden" name="character_id" value="{{ u.character_id }}">
+    <input type="hidden" name="next" value="/gathering/{{ game }}">
+    <span style="min-width:220px;">{{ u.character_name }} <span style="opacity:0.7;">(earliest: {{ u.earliest_ts }})</span></span>
+    <input name="zone" placeholder="actual zone, e.g. The Steamfont Mountains" required style="width:280px;">
+    <input name="note" placeholder="note (optional)">
+    <button type="submit">Confirm</button>
+  </form>
+  {% endfor %}
+</div>
+{% endif %}
+
+{% if not rows %}
+<p>No gathering data yet{% if filters.character or filters.zone or filters.node or filters.item or filters.skill %} matching those filters{% endif %}.</p>
+{% endif %}
+
+{% for node, items in rows|groupby('node') %}
+{% set first = items[0] %}
+<details>
+  <summary>{{ node or '(unknown node)' }}
+    <span style="font-weight:400; font-size:0.85rem; opacity:0.8;">
+      -- tier: {% if first.tier %}{{ first.tier }}{% else %}<span style="color:#c9a227;">&#9888; unidentified</span>{% endif %}
+      {% if first.zone %}, zone hint: {{ first.zone }}{% endif %}
+    </span>
+  </summary>
+  <table class="sortable">
+    <thead>
+      <tr><th>item</th><th>qty</th><th>skill</th><th>chance %</th><th>pulls</th><th>rare pulls</th></tr>
+    </thead>
+    <tbody>
+      {% for r in items %}
+      <tr>
+        <td>{{ r.item }}</td>
+        <td>{{ r.qty }}</td>
+        <td>{{ r.skill }}</td>
+        <td>{{ r.chance_pct }}%</td>
+        <td>{{ r.pulls }}</td>
+        <td>{{ r.rare_pulls or 0 }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</details>
+{% endfor %}
+<script>
+  // Auto-refresh every 10s, but not while you're actively typing into one of
+  // the filter/tier/era forms above -- would otherwise wipe out an in-progress edit.
+  setInterval(() => {
+    const active = document.activeElement;
+    const isTyping = active && (active.tagName === "INPUT" || active.tagName === "SELECT" || active.tagName === "TEXTAREA");
+    if (!isTyping) location.reload();
+  }, 10000);
+</script>
+{% endblock %}
