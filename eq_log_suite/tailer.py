@@ -37,7 +37,15 @@ PID_PATH = Path(__file__).resolve().parent.parent / "logs" / "tailer.pid"
 # still-active encounter so the on-screen timer visibly keeps ticking even
 # between hits.
 COMBAT_TIMEOUT_SECONDS = 6.0
-DPS_TICK_INTERVAL = 1.0
+DPS_TICK_INTERVAL = 0.5
+# How long an in-combat/out-of-combat alert stays on screen before the
+# overlay/MangoHud clear it -- separate from COMBAT_TIMEOUT_SECONDS, which
+# only decides when combat itself is considered over.
+COMBAT_ALERT_DURATION_SECONDS = 10.0
+# Off by default -- was useful to confirm CombatTracker/DPSTracker work
+# correctly, but competes with real alert rules for screen space now that
+# those exist. Flip back to True to re-enable.
+COMBAT_STATE_ALERTS_ENABLED = False
 
 
 class DPSTracker:
@@ -112,6 +120,39 @@ class DPSTracker:
         }
 
 
+class CombatTracker:
+    """Tracks distinct mobs you've swung at recently, to broadcast an
+    in-combat/out-of-combat alert with a live "how many mobs" count --
+    same COMBAT_TIMEOUT_SECONDS window DPSTracker uses to decide combat
+    has ended, but keyed per-mob rather than a single active/paused flag.
+    """
+
+    def __init__(self, label: str):
+        self.label = label
+        self.mobs: dict[str, float] = {}  # target_name -> last swing time
+
+    def record(self, target_name: str, now: float) -> bool:
+        """Adds/refreshes a mob's activity timestamp. Returns True whenever
+        target_name is newly added -- covers both the first hit after being
+        fully out of combat and a new mob joining an already-ongoing fight."""
+        is_new = target_name not in self.mobs
+        self.mobs[target_name] = now
+        return is_new
+
+    def prune(self, now: float) -> bool:
+        """Drops mobs idle past the combat timeout. Returns True exactly on
+        the non-empty -> empty transition (all mobs disengaged)."""
+        was_active = bool(self.mobs)
+        stale = [name for name, t in self.mobs.items() if now - t > COMBAT_TIMEOUT_SECONDS]
+        for name in stale:
+            del self.mobs[name]
+        return was_active and not self.mobs
+
+    @property
+    def count(self) -> int:
+        return len(self.mobs)
+
+
 class OverlayBroadcaster:
     def __init__(self):
         self.clients: set[asyncio.StreamWriter] = set()
@@ -148,6 +189,7 @@ async def tail_log_source(conn, log_source, broadcaster: OverlayBroadcaster):
     parser_cls = get_parser(game_code)
     alert_engine = AlertEngine(conn, log_source["game_id"], broadcast=broadcaster.send)
     dps = DPSTracker(label=f"{character_name} ({game_code})")
+    combat = CombatTracker(label=f"{character_name} ({game_code})")
     rare_tagger = ingest.RareGatherTagger()
 
     path = log_source["file_path"]
@@ -172,6 +214,15 @@ async def tail_log_source(conn, log_source, broadcaster: OverlayBroadcaster):
             elif dps.active and now - dps.last_broadcast >= DPS_TICK_INTERVAL:
                 broadcaster.send(dps.snapshot(now))
                 dps.last_broadcast = now
+
+            if combat.prune(now) and COMBAT_STATE_ALERTS_ENABLED:
+                broadcaster.send({
+                    "kind": "alert",
+                    "key": "combat_state",
+                    "text": "Out of Combat",
+                    "color": [0.55, 0.55, 0.55],
+                    "duration": COMBAT_ALERT_DURATION_SECONDS,
+                })
 
             pos_before = f.tell()
             line_bytes = f.readline()
@@ -214,6 +265,17 @@ async def tail_log_source(conn, log_source, broadcaster: OverlayBroadcaster):
                     if activity:
                         broadcaster.send(dps.snapshot(now))
                         dps.last_broadcast = now
+
+                    if event.event_type in ("melee", "spell_damage", "ability_damage") and event.target_name:
+                        if combat.record(event.target_name, now) and COMBAT_STATE_ALERTS_ENABLED:
+                            mob_word = "mob" if combat.count == 1 else "mobs"
+                            broadcaster.send({
+                                "kind": "alert",
+                                "key": "combat_state",
+                                "text": f"In Combat ({combat.count} {mob_word})",
+                                "color": [0.9, 0.3, 0.2],
+                                "duration": COMBAT_ALERT_DURATION_SECONDS,
+                            })
 
 
 def _game_code_for(conn, game_id: int) -> str:

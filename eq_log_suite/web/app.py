@@ -1374,6 +1374,9 @@ def alerts_list(request: Request):
                 "LEFT JOIN games g ON ar.game_id=g.id ORDER BY ar.id DESC"
             )
             rules = cur.fetchall()
+            for r in rules:
+                r["reaction_types_list"] = (r["reaction_types"] or "").split(",")
+                r["reaction_config_dict"] = json.loads(r["reaction_config"]) if r["reaction_config"] else {}
             cur.execute(
                 "SELECT al.*, ar.name AS rule_name FROM alert_log al "
                 "JOIN alert_rules ar ON al.rule_id=ar.id ORDER BY al.ts DESC LIMIT 100"
@@ -1386,18 +1389,28 @@ def alerts_list(request: Request):
     return templates.TemplateResponse(request, "alerts.html", {"rules": rules, "log": log, "games": games})
 
 
-@app.post("/alerts/create")
-def alerts_create(
-    name: str = Form(...), description: str = Form(""), game_id: str = Form(""),
-    match_type: str = Form(...), pattern: str = Form(...),
-    reaction_types: list[str] = Form([]), sound_file: str = Form(""),
-    overlay_text: str = Form(""), cooldown_seconds: int = Form(0),
-):
+def _reaction_config(sound_file: str, overlay_text: str, duration_seconds: str, countdown: bool) -> dict:
     reaction_config = {}
     if sound_file:
         reaction_config["sound_file"] = sound_file
     if overlay_text:
         reaction_config["overlay_text"] = overlay_text
+    if duration_seconds:
+        reaction_config["duration_seconds"] = int(duration_seconds)
+    if countdown:
+        reaction_config["countdown"] = True
+    return reaction_config
+
+
+@app.post("/alerts/create")
+def alerts_create(
+    name: str = Form(...), description: str = Form(""), game_id: str = Form(""),
+    match_type: str = Form(...), pattern: str = Form(...),
+    reaction_types: list[str] = Form([]), sound_file: str = Form(""),
+    overlay_text: str = Form(""), duration_seconds: str = Form(""),
+    countdown: bool = Form(False), cooldown_seconds: int = Form(0),
+):
+    reaction_config = _reaction_config(sound_file, overlay_text, duration_seconds, countdown)
 
     conn = db.get_connection()
     try:
@@ -1410,6 +1423,35 @@ def alerts_create(
                     int(game_id) if game_id else None, name, description, match_type, pattern,
                     ",".join(reaction_types), json.dumps(reaction_config) if reaction_config else None,
                     cooldown_seconds,
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return RedirectResponse("/alerts", status_code=303)
+
+
+@app.post("/alerts/{rule_id}/update")
+def alerts_update(
+    rule_id: int,
+    name: str = Form(...), description: str = Form(""), game_id: str = Form(""),
+    match_type: str = Form(...), pattern: str = Form(...),
+    reaction_types: list[str] = Form([]), sound_file: str = Form(""),
+    overlay_text: str = Form(""), duration_seconds: str = Form(""),
+    countdown: bool = Form(False), cooldown_seconds: int = Form(0),
+):
+    reaction_config = _reaction_config(sound_file, overlay_text, duration_seconds, countdown)
+
+    conn = db.get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE alert_rules SET game_id=%s, name=%s, description=%s, match_type=%s, pattern=%s, "
+                "reaction_types=%s, reaction_config=%s, cooldown_seconds=%s WHERE id=%s",
+                (
+                    int(game_id) if game_id else None, name, description, match_type, pattern,
+                    ",".join(reaction_types), json.dumps(reaction_config) if reaction_config else None,
+                    cooldown_seconds, rule_id,
                 ),
             )
         conn.commit()
@@ -1435,6 +1477,9 @@ def alerts_delete(rule_id: int):
     conn = db.get_connection()
     try:
         with conn.cursor() as cur:
+            # A firing-history row is meaningless once its rule is gone --
+            # alert_log.rule_id FKs to alert_rules, so it has to go first.
+            cur.execute("DELETE FROM alert_log WHERE rule_id=%s", (rule_id,))
             cur.execute("DELETE FROM alert_rules WHERE id=%s", (rule_id,))
         conn.commit()
     finally:

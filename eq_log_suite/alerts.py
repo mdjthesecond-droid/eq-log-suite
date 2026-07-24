@@ -9,7 +9,10 @@ import subprocess
 import time
 
 FIELDS = {"event_type", "source_name", "source_type", "target_name", "target_type", "verb", "amount", "outcome"}
-_COND_RE = re.compile(r"(?P<field>\w+)\s*(?P<op>=|!=|>=|<=|>|<)\s*(?P<value>[^\s]+)")
+# Value is a quoted string (may contain spaces, e.g. "Lucky Gambit") or a
+# bare non-whitespace token -- quoted must come first so the alternation
+# doesn't stop at the first space inside the quotes.
+_COND_RE = re.compile(r"""(?P<field>\w+)\s*(?P<op>=|!=|>=|<=|>|<)\s*(?P<value>"[^"]*"|'[^']*'|[^\s]+)""")
 
 
 def _coerce(field, value_str, actual):
@@ -50,6 +53,15 @@ def evaluate_condition(expr: str, event) -> bool:
         if not m or not _eval_single(m.group("field"), m.group("op"), m.group("value"), event):
             return False
     return True
+
+
+class _SafeDict(dict):
+    """Leaves an unresolvable {placeholder} in overlay_text as literal text
+    instead of raising -- a typo'd field name shouldn't break the whole
+    reaction, just that one placeholder."""
+
+    def __missing__(self, key):
+        return "{" + key + "}"
 
 
 class AlertEngine:
@@ -110,10 +122,28 @@ class AlertEngine:
         if "sound" in reactions and config.get("sound_file"):
             subprocess.Popen(["paplay", config["sound_file"]])
         if "overlay" in reactions:
+            text = config.get("overlay_text", matched_text)
+            fields = _SafeDict(
+                source_name=event.source_name, source_type=event.source_type,
+                target_name=event.target_name, target_type=event.target_type,
+                verb=event.verb, amount=event.amount, outcome=event.outcome,
+                matched_text=matched_text,
+            )
             self.broadcast({
                 "kind": "alert",
-                "text": config.get("overlay_text", matched_text),
+                # Identifies this alert's source so consumers can show
+                # multiple concurrent alerts side by side (different rules)
+                # while still replacing-in-place rather than duplicating
+                # when the *same* rule re-fires (e.g. a refreshed buff).
+                "key": f"rule_{rule['id']}",
+                "text": text.format_map(fields),
                 "color": config.get("color", [0.9, 0.3, 0.2]),
                 "duration": config.get("duration_seconds", 6),
+                # When set, duration above doubles as a countdown length --
+                # consumers render "{text} - Ns" ticking down to 0, rather
+                # than showing static text for that long. The number comes
+                # from the user's own knowledge of the ability (cast time,
+                # discipline duration, etc.) -- not derivable from the log.
+                "countdown": bool(config.get("countdown")),
             })
         # 'log' is implicit -- the alert_log row above always happens.

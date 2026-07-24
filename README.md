@@ -48,23 +48,95 @@ the KDE app menu, or use the icons directly):
   window. Not part of normal play right now: KWin gives a focused fullscreen
   game its own stacking layer above ordinary "always on top" windows, so the
   overlay only reliably renders when the game isn't fullscreen-focused (menus,
-  loading screens, or if you ever switch a game to true windowed mode). A real
-  fix would mean graphics-API-level overlay injection (how MangoHud/Steam's
-  overlay actually do it), which is a much bigger project than this app --
-  left here in case that's worth revisiting later.
-- **EQ Log Suite - Stop** -- stops the tailer, overlay, and web UI, whichever
-  of them are running.
+  loading screens, or if you ever switch a game to true windowed mode).
+  Confirmed this isn't a simple KWin setting -- `WindowsBlockCompositing` is
+  already `false` here, so the compositor isn't fully suspending for
+  fullscreen; it's KWin's fullscreen stacking layer specifically. The real
+  fix (below) is graphics-API-level overlay injection, same as MangoHud/
+  Steam's own overlay.
+- **EQ Log Suite - Stop** -- stops the tailer, overlay, MangoHud alert
+  writer, and web UI, whichever of them are running.
 
 They're backed by plain shell scripts in `bin/` (`start-tailer.sh`,
-`start-overlay.sh`, `start-web.sh`, `stop-all.sh`) if you'd rather run them
-from a terminal, or want to see what they're doing. All are safe to re-run --
-they check what's already running before starting anything new. Logs from
-each go to `logs/tailer.log`, `logs/overlay.log`, `logs/web.log`.
+`start-overlay.sh`, `start-mangohud-alerts.sh`, `start-web.sh`, `stop-all.sh`)
+if you'd rather run them from a terminal, or want to see what they're doing.
+All are safe to re-run -- they check what's already running before starting
+anything new. Logs from each go to `logs/tailer.log`, `logs/overlay.log`,
+`logs/mangohud_alerts.log`, `logs/web.log`.
 
 The desktop entries live in `~/.local/share/applications/eq-log-suite-*.desktop`
 and point at the scripts in this project's `bin/` directory by absolute path,
 so they'll keep working as long as this project stays at
 `/var/home/myself/claudes/eq-log-suite/`.
+
+## Alerts over fullscreen (MangoHud)
+
+The GTK overlay above doesn't reliably render over a focused fullscreen
+game (see its note above); MangoHud does, because it draws inside the
+game's own Vulkan/GL swapchain rather than being a window KWin has to
+stack. Confirmed working on this machine against EQ2 running through Proton
+via a Steam non-Steam-game shortcut.
+
+Setup (one-time):
+
+1. Bazzite already ships MangoHud -- nothing to install.
+2. Right-click the EQ2 shortcut in Steam -> Properties -> Launch Options:
+   ```
+   MANGOHUD_CONFIGFILE=/home/myself/.config/MangoHud/eq_log_suite.conf mangohud %command%
+   ```
+   Using a dedicated config file (not `~/.config/MangoHud/MangoHud.conf`)
+   keeps this from touching whatever MangoHud settings you use for other
+   games.
+3. Create that config file with two `exec`/`custom_text` pairs -- one for a
+   live DPS readout, one for alerts:
+   ```
+   position=top-left
+   exec=cat /var/home/myself/claudes/eq-log-suite/logs/mangohud_dps.txt
+   custom_text=DPS
+   exec=cat /var/home/myself/claudes/eq-log-suite/logs/mangohud_alert.txt
+   custom_text=Alert
+   ```
+   `exec`'s output is the value shown; `custom_text` is just its label --
+   the two must be paired like this, `custom_text` alone doesn't render
+   anything (learned the hard way -- a bare `custom_text` with no `exec`
+   next to it never appears on screen, regardless of position or preset).
+   `custom_text_center` was tried for the alert slot (hoping for a
+   screen-centered alert, separate from the DPS line) but it doesn't pair
+   with a preceding `exec` the way plain `custom_text` does -- it only ever
+   renders its own literal configured string, centered and disconnected
+   from any exec output next to it. So both DPS and Alert use plain
+   `custom_text` and sit in the same row for now.
+
+   MangoHud polls each `exec` command on its own and re-renders on change,
+   no reload keypress needed -- confirmed by editing the file live and
+   watching it update in-game. Also confirmed safe to add MangoHud's own
+   layout/color/font options (`horizontal`, `table_columns`, `*_color`,
+   `font_size`, etc., e.g. via the MangoJuice GUI) into this same file
+   alongside the two `exec`/`custom_text` pairs above -- just watch out
+   that GUI config tools tend to rewrite the *entire* file when you save
+   from them, silently dropping the `exec=` lines since they're not exposed
+   in the GUI. Re-add the two pairs above after any GUI-driven edit.
+
+Everyday use: **EQ Log Suite - MangoHud Alerts** (or `bin/start-mangohud-alerts.sh`)
+instead of the regular Overlay launcher. It starts the tailer (if not
+already running) plus `eq_log_suite/overlay/mangohud_writer.py`, which
+listens on the same alert-broadcast socket the GTK overlay uses and writes:
+- the live DPS/hit%/crit% snapshot to `logs/mangohud_dps.txt`, refreshed
+  every 0.5s while active and frozen (not cleared) once combat pauses, same
+  behavior as the GTK overlay's own DPS meter;
+- whichever alert most recently fired to `logs/mangohud_alert.txt`,
+  clearing it again once that alert's configured duration has passed. This
+  includes a built-in in-combat/out-of-combat alert (`tailer.py`'s
+  `CombatTracker`) showing how many distinct mob *names* you're currently
+  trading hits with -- note "names," not instances: the log format has no
+  per-mob ID, so two simultaneously-engaged mobs sharing an identical
+  generic name (e.g. two "a lowland viper") collapse into one count.
+
+Known limitation: MangoHud only gives you a couple of fixed exec/custom_text
+slots, not a real queue -- so unlike the GTK overlay's stacked,
+per-message-colored annotations, this shows one line per slot: whatever
+fired most recently. Fine for "something just happened," not a substitute
+for the richer overlay if you're ever in windowed mode.
 
 MariaDB itself is a systemd service (`sudo systemctl enable --now mariadb`
 was run during setup), so it starts automatically on boot -- nothing to

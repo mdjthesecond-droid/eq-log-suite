@@ -2,10 +2,39 @@
 {% block title %}Alerts{% endblock %}
 {% block content %}
 <h1>Alert Rules</h1>
-<p>Rules are evaluated by the tailer against every live event. <code>field_condition</code> uses a
-small whitelisted mini-language: <code>field OP value (AND field OP value)*</code> over
-<code>event_type, source_name, source_type, target_name, target_type, verb, amount, outcome</code>
--- e.g. <code>target_type=you AND amount&gt;200</code>.</p>
+<p>Rules are evaluated by the tailer against every live event.</p>
+
+<details open>
+  <summary>field_condition syntax help</summary>
+  <p>A small whitelisted mini-language (deliberately not real code, since rules come from this
+  form): <code>field OP value (AND field OP value)*</code>. <code>AND</code> only -- no
+  <code>OR</code>, no parentheses. Operators: <code>= != &gt; &lt; &gt;= &lt;=</code>. Text fields
+  compare case-insensitively; <code>amount</code> compares numerically and is the only field
+  <code>&gt;</code>/<code>&lt;</code> make sense on. Quote a value if it contains spaces, e.g.
+  <code>verb="Lucky Gambit"</code>.</p>
+
+  <table class="wrap-table">
+    <thead><tr><th>field</th><th>meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>event_type</code></td><td>e.g. <code>melee</code>, <code>ability_damage</code>, <code>spell_damage</code>, <code>spell_heal</code>, <code>threat</code>, <code>combat_state</code>, <code>death</code>, <code>zone_change</code>, <code>gather</code>, <code>rare_found</code>, <code>hail</code>, <code>loot</code>, <code>quest</code>, <code>exp</code> -- varies by game, check <code>/events</code> for what's actually showing up</td></tr>
+      <tr><td><code>source_name</code> / <code>target_name</code></td><td>actor name as logged -- literally <code>You</code> for yourself, generic article-prefixed text like <code>a lowland viper</code> for trash mobs, or a proper name for named/unique actors and other players</td></tr>
+      <tr><td><code>source_type</code> / <code>target_type</code></td><td><code>you</code>, <code>npc</code> (generic trash mob), or <code>unknown</code> (a named actor -- could be a unique NPC, a player, or a pet; not distinguishable from log text alone)</td></tr>
+      <tr><td><code>verb</code></td><td>meaning depends on <code>event_type</code> -- it's the <strong>ability/spell name</strong> for <code>ability_damage</code>/<code>spell_damage</code>/<code>threat</code>, the miss/avoid word (<code>misses</code>, <code>dodges</code>, ...) for an avoided melee swing, or <code>start</code>/<code>stop</code> for <code>combat_state</code>. Notably <em>not</em> where an ability's name ends up for a hit you land yourself -- see example 2.</td></tr>
+      <tr><td><code>amount</code></td><td>numeric -- damage or threat amount</td></tr>
+      <tr><td><code>outcome</code></td><td><code>hit</code>, <code>miss</code>, <code>riposte</code>, <code>parry</code>, <code>dodge</code>, <code>block</code>, or empty where it doesn't apply</td></tr>
+    </tbody>
+  </table>
+
+  <p><strong>Examples:</strong></p>
+  <ul>
+    <li><code>target_type=you AND amount&gt;200</code> -- you took a hit over 200 damage, from anything.</li>
+    <li><code>verb="Lucky Gambit" AND source_type=you AND amount&gt;1</code> -- your own "Lucky Gambit"
+    ability landed for more than 1 damage. Learned the hard way: <code>source_name="Lucky Gambit"</code>
+    looks right but never matches -- for an ability <em>you</em> land, <code>source_name</code> is
+    literally <code>You</code>, and the ability's name is in <code>verb</code> instead.</li>
+    <li><code>event_type=zone_change AND source_type=you</code> -- fires every time you zone.</li>
+  </ul>
+</details>
 <form method="post" action="/alerts/create">
   <input name="name" placeholder="name" required>
   <input name="description" placeholder="description">
@@ -24,6 +53,8 @@ small whitelisted mini-language: <code>field OP value (AND field OP value)*</cod
   <label><input type="checkbox" name="reaction_types" value="log" checked> log</label>
   <input name="sound_file" placeholder="sound file path (if sound)">
   <input name="overlay_text" placeholder="overlay text override (optional)">
+  <input name="duration_seconds" type="number" placeholder="overlay duration (s, default 6)">
+  <label title="counts down instead of showing static text -- duration above becomes the countdown length"><input type="checkbox" name="countdown"> countdown</label>
   <input name="cooldown_seconds" type="number" value="0" placeholder="cooldown (s)">
   <button type="submit">Create</button>
 </form>
@@ -39,6 +70,32 @@ small whitelisted mini-language: <code>field OP value (AND field OP value)*</cod
       <td>{{ r.match_type }}</td><td>{{ r.pattern }}</td><td>{{ r.reaction_types }}</td>
       <td>{{ r.cooldown_seconds }}</td><td>{{ 'yes' if r.enabled else 'no' }}</td>
       <td>
+        <details>
+          <summary>edit</summary>
+          <form method="post" action="/alerts/{{ r.id }}/update" style="margin-top:0.5rem">
+            <input name="name" placeholder="name" value="{{ r.name }}" required>
+            <input name="description" placeholder="description" value="{{ r.description or '' }}">
+            <select name="game_id">
+              <option value="">All games</option>
+              {% for g in games %}<option value="{{ g.id }}" {{ 'selected' if r.game_id == g.id }}>{{ g.code }}</option>{% endfor %}
+            </select>
+            <select name="match_type">
+              <option value="regex" {{ 'selected' if r.match_type == 'regex' }}>regex (matches raw_line)</option>
+              <option value="field_condition" {{ 'selected' if r.match_type == 'field_condition' }}>field_condition</option>
+            </select>
+            <input name="pattern" placeholder="pattern / condition" style="width:320px" value="{{ r.pattern }}" required>
+            <label><input type="checkbox" name="reaction_types" value="notify" {{ 'checked' if 'notify' in r.reaction_types_list }}> notify</label>
+            <label><input type="checkbox" name="reaction_types" value="sound" {{ 'checked' if 'sound' in r.reaction_types_list }}> sound</label>
+            <label><input type="checkbox" name="reaction_types" value="overlay" {{ 'checked' if 'overlay' in r.reaction_types_list }}> overlay</label>
+            <label><input type="checkbox" name="reaction_types" value="log" {{ 'checked' if 'log' in r.reaction_types_list }}> log</label>
+            <input name="sound_file" placeholder="sound file path (if sound)" value="{{ r.reaction_config_dict.sound_file or '' }}">
+            <input name="overlay_text" placeholder="overlay text override (optional)" value="{{ r.reaction_config_dict.overlay_text or '' }}">
+            <input name="duration_seconds" type="number" placeholder="overlay duration (s, default 6)" value="{{ r.reaction_config_dict.duration_seconds or '' }}">
+            <label title="counts down instead of showing static text -- duration above becomes the countdown length"><input type="checkbox" name="countdown" {{ 'checked' if r.reaction_config_dict.countdown }}> countdown</label>
+            <input name="cooldown_seconds" type="number" value="{{ r.cooldown_seconds }}" placeholder="cooldown (s)">
+            <button type="submit">Save</button>
+          </form>
+        </details>
         <form method="post" action="/alerts/{{ r.id }}/toggle" style="display:inline"><button>toggle</button></form>
         <form method="post" action="/alerts/{{ r.id }}/delete" style="display:inline"><button>delete</button></form>
       </td>

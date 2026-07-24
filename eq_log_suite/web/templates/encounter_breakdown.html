@@ -10,7 +10,7 @@
 {% endif %}
 
 {% macro attack_table(rows) %}
-<div style="overflow-x:auto">
+<div class="scroll-frame">
 <table class="sortable">
   <thead>
     <tr>
@@ -78,7 +78,7 @@
   <h3>Everyone else</h3>
   <div class="others-block" data-npc="{{ n.npc }}">
     <button type="button" class="expand-all" style="margin-bottom:0.4rem;">expand all</button>
-    <div style="overflow-x:auto">
+    <div class="scroll-frame">
     <table class="others-summary">
       <thead>
         <tr><th>combatant</th><th>dmg out</th><th>dps out</th><th>dmg in</th><th>dps in</th><th></th></tr>

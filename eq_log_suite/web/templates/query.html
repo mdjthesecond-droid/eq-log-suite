@@ -9,7 +9,7 @@
 {% if error %}<p class="error">{{ error }}</p>{% endif %}
 {% if rows %}
 <p>{{ rows|length }} rows</p>
-<div style="overflow-x:auto">
+<div class="scroll-frame">
 <table class="sortable" id="query-results">
   <thead><tr>{% for c in columns %}<th>{{ c }}</th>{% endfor %}</tr></thead>
   <tbody>

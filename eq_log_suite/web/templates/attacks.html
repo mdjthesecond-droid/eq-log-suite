@@ -19,7 +19,7 @@ Min/avg/max damage are split by hit vs. crit since crits skew the average.</p>
 {% if not outgoing %}
 <p>No outgoing attack data{% if filters.character or filters.start_ts or filters.end_ts %} matching those filters{% endif %}.</p>
 {% endif %}
-<div style="overflow-x:auto">
+<div class="scroll-frame">
 <table class="sortable">
   <thead>
     <tr>
@@ -58,7 +58,7 @@ Min/avg/max damage are split by hit vs. crit since crits skew the average.</p>
 {% if not incoming %}
 <p>No incoming attack data{% if filters.character or filters.start_ts or filters.end_ts %} matching those filters{% endif %}.</p>
 {% endif %}
-<div style="overflow-x:auto">
+<div class="scroll-frame">
 <table class="sortable">
   <thead>
     <tr>

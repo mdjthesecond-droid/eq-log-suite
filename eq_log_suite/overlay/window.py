@@ -132,8 +132,11 @@ class Overlay(Gtk.Window):
         self.connect("realize", self.on_realize)
         self.connect("destroy", Gtk.main_quit)
 
-        # alert-triggered flash messages only -- list of (expires_at, text, color)
-        self.annotations: list[tuple[float, str, tuple[float, float, float]]] = []
+        # alert-triggered flash messages only -- key -> (expires_at, text, color,
+        # countdown). Keyed (rather than a plain list) so a rule re-firing before
+        # its previous instance expires (e.g. a refreshed buff) replaces its own
+        # entry in place instead of stacking a duplicate box.
+        self.annotations: dict[str, tuple[float, str, tuple[float, float, float], bool]] = {}
         # label -> (snapshot dict, local_received_at) -- one persistent meter per
         # live-tailed character, pauses (freezes) rather than disappearing when
         # combat ends, and is dropped only after DPS_STALE_SECONDS of disuse.
@@ -238,7 +241,7 @@ class Overlay(Gtk.Window):
             self._handle_message(msg, now)
 
         before = len(self.annotations)
-        self.annotations = [a for a in self.annotations if a[0] > now]
+        self.annotations = {k: a for k, a in self.annotations.items() if a[0] > now}
 
         before_meters = len(self.dps_meters)
         self.dps_meters = {
@@ -247,7 +250,8 @@ class Overlay(Gtk.Window):
             if now - seen_at < DPS_STALE_SECONDS
         }
 
-        if changed or len(self.annotations) != before or len(self.dps_meters) != before_meters:
+        has_countdown = any(a[3] for a in self.annotations.values())
+        if changed or len(self.annotations) != before or len(self.dps_meters) != before_meters or has_countdown:
             self.queue_draw()
         return True  # keep the timeout running
 
@@ -260,11 +264,14 @@ class Overlay(Gtk.Window):
             self.current_zones[msg["label"]] = msg["zone"]
             return
         if kind == "alert":
+            key = msg.get("key") or f"_unkeyed_{now}"
             text = msg.get("text", "")
             color = tuple(msg.get("color", DEFAULT_COLOR))
             duration = float(msg.get("duration", DEFAULT_LIFETIME))
-            self.annotations.append((now + duration, text, color))
-            self.annotations = self.annotations[-MAX_ANNOTATIONS:]
+            countdown = bool(msg.get("countdown"))
+            self.annotations[key] = (now + duration, text, color, countdown)
+            while len(self.annotations) > MAX_ANNOTATIONS:
+                self.annotations.pop(next(iter(self.annotations)))
 
     def on_draw(self, widget, ctx: cairo.Context):
         ctx.set_source_rgba(0, 0, 0, 0)
@@ -283,9 +290,12 @@ class Overlay(Gtk.Window):
         ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
         ctx.set_font_size(16)
 
+        now = time.monotonic()
         x, y = 60, 60
         line_height = 26
-        for _, text, color in self.annotations:
+        for expires_at, text, color, countdown in self.annotations.values():
+            if countdown:
+                text = f"{text} - {max(0, round(expires_at - now))}s"
             r, g, b = color
             extents = ctx.text_extents(text)
             pad = 8

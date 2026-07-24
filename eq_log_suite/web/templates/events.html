@@ -18,7 +18,7 @@
 <details><summary>View as SQL</summary><pre>{{ sql }}</pre></details>
 <input type="text" data-filter-for="events-results" placeholder="quick filter (client-side, current page only)...">
 <p>{{ rows|length }} rows</p>
-<div style="overflow-x:auto">
+<div class="scroll-frame">
 <table class="sortable" id="events-results">
   <thead><tr>{% for c in columns %}<th{% if c == 'raw_line' %} class="col-raw-line"{% endif %}>{{ c }}</th>{% endfor %}</tr></thead>
   <tbody>
