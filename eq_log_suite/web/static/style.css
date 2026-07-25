@@ -79,3 +79,7 @@ pre { white-space: pre-wrap; word-break: break-word; background: #1c1f29; paddin
 .dlg-npc_dialogue { color: var(--accent); }
 .dlg-hail { font-style: italic; opacity: 0.8; }
 .dlg-reward { color: #7fd88f; }
+.dlg-item_offer { font-style: italic; opacity: 0.8; }
+.dlg-trade_complete { color: #7fd88f; }
+.dlg-exp { color: #7fd88f; }
+.dlg-faction { color: #7fd88f; }

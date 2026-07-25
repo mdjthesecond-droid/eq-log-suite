@@ -61,8 +61,9 @@
 {% else %}<p>No loot recorded from this NPC yet{% if tier != 'all' %} at this difficulty{% endif %}.</p>{% endif %}
 
 <h2>Quests</h2>
-<p style="opacity:0.7;">Classic EQ has no logged turn-in action, so "begun"/"ended" here are a
-best-effort heuristic (first contact vs. most recent reward received), not real quest tracking.</p>
+<p style="opacity:0.7;">Classic EQ rarely logs a turn-in action, so "begun"/"ended" here are a
+best-effort heuristic (first contact vs. most recent reward or completed trade), not guaranteed
+quest tracking.</p>
 <p>
   {% if quest_begun_at %}<strong>First contact:</strong> {{ quest_begun_at }}{% endif %}
   {% if quest_ended_at %} &middot; <strong>Last reward:</strong> {{ quest_ended_at }}{% endif %}
@@ -90,6 +91,12 @@ best-effort heuristic (first contact vs. most recent reward received), not real 
           <strong>{{ r.npc }}</strong> says, '{{ r.text }}'
         {%- elif r.kind == 'reward' -%}
           &#10003; received {% if r.loot_link %}<a href="{{ r.loot_link }}">{{ r.text }}</a>{% else %}{{ r.text }}{% endif %} from {{ r.npc }}
+        {%- elif r.kind == 'item_offer' -%}
+          &rarr; offered {{ r.amount }} {{ r.text }} to {{ r.npc }}
+        {%- elif r.kind == 'trade_complete' -%}
+          &#10003; completed trade with {{ r.npc }}
+        {%- elif r.kind in ('exp', 'faction') -%}
+          &#10003; reward: {{ r.text }}
         {%- endif -%}
         </span>
       </td>

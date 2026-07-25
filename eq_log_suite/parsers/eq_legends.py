@@ -573,6 +573,36 @@ def h_vendor_sell(m):
     )
 
 
+def h_item_offer(m):
+    # "You offered 1 Letter For Doug to Doug." -- the actual "give item to
+    # NPC" action, confirmed real (previously a known gap: no signal at all
+    # for what item you handed over, only what you got back). The NPC's
+    # narrative response line right after this ("Doug  carefully reads
+    # over the letter before looking up at you and responding. '...'") is
+    # deliberately NOT handled -- only one real example exists, and its
+    # phrasing is clearly bespoke per-quest flavor text, not a fixed
+    # template like this line -- so it's left unparsed rather than guessed
+    # at from a single sample.
+    return ParsedEvent(
+        ts=None, raw_line=None, event_type="item_offer",
+        source_name="You", source_type="you",
+        target_name=m.group("npc"), target_type="npc",
+        verb=None, amount=int(m.group("qty")), outcome=None,
+        extra={"item": m.group("item")},
+    )
+
+
+def h_trade_complete(m):
+    # "You complete the trade with Doug." -- confirmed real, fires right
+    # after a successful h_item_offer exchange.
+    return ParsedEvent(
+        ts=None, raw_line=None, event_type="trade_complete",
+        source_name="You", source_type="you",
+        target_name=m.group("npc"), target_type="npc",
+        verb=None, amount=None, outcome=None,
+    )
+
+
 def h_loot(m):
     qty = int(m.group("qty")) if m.group("qty") else 1
     return ParsedEvent(
@@ -763,6 +793,12 @@ class EQLegendsParser(GameParser):
         (re.compile(
             r"^You looted (?:(?P<qty>\d+) )?(?P<item>.+?) from (?P<source>.+?)'s corpse"
         ), h_loot),
+
+        # "You offered 1 Letter For Doug to Doug." -- the actual turn-in action.
+        (re.compile(r"^You offered (?P<qty>\d+) (?P<item>.+?) to (?P<npc>.+?)\.$"), h_item_offer),
+
+        # "You complete the trade with Doug."
+        (re.compile(r"^You complete the trade with (?P<npc>.+?)\.$"), h_trade_complete),
 
         (re.compile(
             r"^Your faction standing with (?P<faction>.+?) has been adjusted by (?P<delta>-?\d+)\.$"

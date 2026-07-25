@@ -39,15 +39,30 @@
     <strong>In from:</strong>
     {% if in_from %}
     <ul>{% for c in in_from %}<li><a href="/zoneinfo/{{ game }}/detail?zone={{ c.from_zone|urlencode }}">{{ c.from_zone }}</a> ({{ c.times }}x)</li>{% endfor %}</ul>
-    {% else %}<p style="opacity:0.7;">none observed (excluding gate/origin trips)</p>{% endif %}
+    {% else %}<p style="opacity:0.7;">none observed (excluding gate/origin/translocator trips)</p>{% endif %}
   </div>
   <div>
     <strong>Out to:</strong>
     {% if out_to %}
     <ul>{% for c in out_to %}<li><a href="/zoneinfo/{{ game }}/detail?zone={{ c.to_zone|urlencode }}">{{ c.to_zone }}</a> ({{ c.times }}x)</li>{% endfor %}</ul>
-    {% else %}<p style="opacity:0.7;">none observed (excluding gate/origin trips)</p>{% endif %}
+    {% else %}<p style="opacity:0.7;">none observed (excluding gate/origin/translocator trips)</p>{% endif %}
   </div>
 </div>
+
+<h2>Translocators</h2>
+<p style="opacity:0.7;">NPCs here that translocate you elsewhere -- a distinct fast-travel method,
+not a walkable connection, so kept separate from Connections above. Destination(s) are confirmed
+from your own actual trips, not just what the NPC offers in dialogue (they may offer more choices
+than you've taken).</p>
+{% if translocators_here %}
+<ul>
+  {% for t in translocators_here %}
+  <li><a href="/npcs/{{ game }}/detail?npc={{ t.translocator|urlencode }}">{{ t.translocator }}</a>
+    &rarr; <a href="/zoneinfo/{{ game }}/detail?zone={{ t.to_zone|urlencode }}">{{ t.to_zone }}</a>
+    ({{ t.times }}x)</li>
+  {% endfor %}
+</ul>
+{% else %}<p style="opacity:0.7;">None confirmed here yet.</p>{% endif %}
 
 <h2>Rare mobs</h2>
 {% if rares %}

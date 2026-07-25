@@ -507,7 +507,20 @@ def _compute_quests(game, character="", quest="", zone="", npc=""):
 _CURRENCY_TEXT_RE = re.compile(r"^[\d,]+\s*(platinum|gold|silver|copper)\b", re.IGNORECASE)
 
 
-def _compute_dialogue(game, character="", npc="", zone=""):
+_CHATTER_EXCLUDED_NPCS = {"voidling"}  # the raid encounter generator, not a real dialogue NPC
+
+
+def _is_chatter_excluded_npc(name):
+    lower = name.lower()
+    if lower in _CHATTER_EXCLUDED_NPCS:
+        return True
+    # Translocators just move you between zones (see _compute_zone_translocators,
+    # which surfaces that as its own zone-connection method) -- hailing one
+    # isn't real quest dialogue.
+    return lower.startswith("translocator ")
+
+
+def _compute_dialogue(game, character="", npc="", zone="", exclude_chatter=False):
     # Classic EQ quests aren't structured turn-ins like EQ2's -- they're
     # branching NPC dialogue (bracketed [keywords] you echo back) plus
     # whatever you're handed in return. There's no logged "give item to
@@ -532,29 +545,84 @@ def _compute_dialogue(game, character="", npc="", zone=""):
     def branch(event_type, npc_expr, text_expr):
         return (
             "SELECT ev.ts, c.name AS character_name, ev.event_type AS kind, "
-            f"{npc_expr} AS npc, {text_expr} AS text, "
+            f"{npc_expr} AS npc, {text_expr} AS text, ev.amount AS amount, "
             f"{_ZONE_LOOKUP_EXPR} AS zone "
             "FROM events ev JOIN games g ON ev.game_id=g.id JOIN characters c ON ev.character_id=c.id "
             f"WHERE ev.event_type='{event_type}' {inner_where}"
         )
 
-    sql = (
-        "SELECT * FROM ("
-        + branch("hail", "ev.target_name", "NULL") + " UNION ALL "
-        + branch("say", "NULL", "JSON_UNQUOTE(JSON_EXTRACT(ev.extra,'$.text'))") + " UNION ALL "
-        + branch("npc_dialogue", "ev.source_name", "JSON_UNQUOTE(JSON_EXTRACT(ev.extra,'$.text'))") + " UNION ALL "
-        + branch("reward", "ev.source_name", "JSON_UNQUOTE(JSON_EXTRACT(ev.extra,'$.text'))")
-        + ") t "
-        + f"{outer_where} ORDER BY character_name, ts"
-    )
+    branches = [
+        branch("hail", "ev.target_name", "NULL"),
+        branch("say", "NULL", "JSON_UNQUOTE(JSON_EXTRACT(ev.extra,'$.text'))"),
+        branch("npc_dialogue", "ev.source_name", "JSON_UNQUOTE(JSON_EXTRACT(ev.extra,'$.text'))"),
+        branch("reward", "ev.source_name", "JSON_UNQUOTE(JSON_EXTRACT(ev.extra,'$.text'))"),
+        # "You offered 1 Letter For Doug to Doug." -- the actual turn-in
+        # action (see h_item_offer); item name lives in extra, qty in amount.
+        branch("item_offer", "ev.target_name", "JSON_UNQUOTE(JSON_EXTRACT(ev.extra,'$.item'))"),
+        # "You complete the trade with Doug." -- no text of its own, just a
+        # marker that an offer succeeded.
+        branch("trade_complete", "ev.target_name", "NULL"),
+    ]
+    sql = "SELECT * FROM (" + " UNION ALL ".join(branches) + ") t " + f"{outer_where} ORDER BY character_name, ts"
 
     conn = db.get_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute(sql, (inner_params * 4) + outer_params)
+            cur.execute(sql, (inner_params * len(branches)) + outer_params)
             rows = cur.fetchall()
+
+            # The reward for a trade isn't always the currency-from-npc
+            # `reward` event -- confirmed real: the one trade in the log
+            # (Doug/Letter For Doug) paid out as a plain XP gain instead,
+            # with no `reward` event at all. Rewards can also be a faction
+            # adjustment, or several of these at once (XP + faction + a
+            # `reward` row, all for the same trade). None of those carry an
+            # npc of their own, so they're fetched separately (scoped only
+            # by character/game, not npc/zone -- those filters apply below,
+            # after attaching them to whichever trade_complete they belong
+            # to) and matched to the nearest trade_complete within
+            # TRADE_REWARD_WINDOW_S for the same character.
+            exp_rows = faction_rows = []
+            if any(r["kind"] == "trade_complete" for r in rows):
+                cur.execute(
+                    "SELECT c.name AS character_name, ev.ts, JSON_EXTRACT(ev.extra,'$.percent') AS percent "
+                    "FROM events ev JOIN games g ON ev.game_id=g.id JOIN characters c ON ev.character_id=c.id "
+                    f"WHERE ev.event_type='exp' {inner_where}",
+                    inner_params,
+                )
+                exp_rows = cur.fetchall()
+                cur.execute(
+                    "SELECT c.name AS character_name, ev.ts, ev.target_name AS faction, ev.amount AS delta "
+                    "FROM events ev JOIN games g ON ev.game_id=g.id JOIN characters c ON ev.character_id=c.id "
+                    f"WHERE ev.event_type='faction' {inner_where}",
+                    inner_params,
+                )
+                faction_rows = cur.fetchall()
     finally:
         conn.close()
+
+    TRADE_REWARD_WINDOW_S = 10  # the one confirmed real trade paid its XP
+    # in the same second as "You complete the trade..."; generous margin
+    # against timing jitter without reaching into unrelated combat XP/faction.
+
+    reward_extras = []
+    for tc in (r for r in rows if r["kind"] == "trade_complete"):
+        for er in exp_rows:
+            if er["character_name"] == tc["character_name"] and abs((er["ts"] - tc["ts"]).total_seconds()) <= TRADE_REWARD_WINDOW_S:
+                reward_extras.append({
+                    "ts": er["ts"], "character_name": tc["character_name"], "kind": "exp",
+                    "npc": tc["npc"], "zone": tc["zone"],
+                    "text": f'{float(er["percent"]):.3g}% experience', "amount": None,
+                })
+        for fr in faction_rows:
+            if fr["character_name"] == tc["character_name"] and abs((fr["ts"] - tc["ts"]).total_seconds()) <= TRADE_REWARD_WINDOW_S:
+                sign = "+" if fr["delta"] >= 0 else ""
+                reward_extras.append({
+                    "ts": fr["ts"], "character_name": tc["character_name"], "kind": "faction",
+                    "npc": tc["npc"], "zone": tc["zone"],
+                    "text": f'{fr["faction"]} {sign}{fr["delta"]}', "amount": None,
+                })
+    rows = sorted(rows + reward_extras, key=lambda r: (r["character_name"], r["ts"]))
 
     # Collapse repeats of the exact same line (everything but ts) -- e.g. a
     # generic mob's canned bark ("A grikbar kobold says, 'Grrrrr...'")
@@ -564,12 +632,35 @@ def _compute_dialogue(game, character="", npc="", zone=""):
     seen = set()
     deduped = []
     for r in rows:
-        key = (r["character_name"], r["kind"], r["npc"], r["zone"], r["text"])
+        key = (r["character_name"], r["kind"], r["npc"], r["zone"], r["text"], r["amount"])
         if key in seen:
             continue
         seen.add(key)
         deduped.append(r)
     rows = deduped
+
+    if exclude_chatter:
+        # /quests wants to hide pure ambient chatter (a generic mob's bark
+        # with no [bracketed] keyword and no reward attached) -- that data
+        # isn't lost, it's just not quest-relevant enough for the aggregate
+        # transcript; it's still on that NPC's own /npcs page (which calls
+        # _compute_dialogue without this flag). Qualification is per-NPC,
+        # not per-line: once an NPC has shown even one bracketed line or a
+        # reward, ALL of that NPC's rows here are kept (including the hail/
+        # say around it) so the surrounding conversation still reads in
+        # context, rather than showing isolated bracketed lines with no
+        # setup. "say" rows have no npc attribution in this data model (the
+        # log doesn't say who you were replying to) and so never qualify on
+        # their own, same as npc_detail's existing npc-filtered view.
+        quest_npcs = {
+            r["npc"] for r in rows
+            if r["npc"] and (
+                r["kind"] in ("reward", "item_offer", "trade_complete")
+                or (r["kind"] == "npc_dialogue" and r["text"] and "[" in r["text"])
+            )
+            and not _is_chatter_excluded_npc(r["npc"])
+        }
+        rows = [r for r in rows if r["npc"] in quest_npcs]
 
     # A reward whose text doesn't read as a currency amount is (once bare
     # item-reward parsing exists -- see h_npc_reward's known gaps) an item
@@ -584,7 +675,7 @@ def _compute_dialogue(game, character="", npc="", zone=""):
 
 @app.get("/quests/eql", response_class=HTMLResponse)
 def quests_report_eql(request: Request, character: str = "", npc: str = "", zone: str = ""):
-    rows = _compute_dialogue("eql", character, npc, zone)
+    rows = _compute_dialogue("eql", character, npc, zone, exclude_chatter=True)
     return templates.TemplateResponse(request, "dialogue.html", {
         "rows": rows, "game": "eql", "game_label": "EQ Legends",
         "unresolved_zone_starts": _unresolved_zone_starts("eql"),
@@ -898,12 +989,91 @@ def _compute_zone_list(game):
     return rows
 
 
+def _translocator_routes(game):
+    """Raw (translocator, character_id, from_zone, to_zone, hail_ts,
+    zone_ts) rows: a hail directed at an NPC named "Translocator ..."
+    followed by a zone_change within GATE_EXCLUSION_WINDOW_S for that same
+    character -- confirmed real (12-19s gaps for every real translocator
+    hail in the log, well within that window). Translocators offer a menu
+    of destinations in their own dialogue text ("[travel to Ocean of
+    Tears]", "[Qeynos]", ...), but that flavor text doesn't reliably match
+    the canonical zone names used everywhere else here (e.g. "Qeynos" isn't
+    itself a real zone -- "North Qeynos"/"South Qeynos" are), so this uses
+    the same real zone_change correlation as everything else instead of
+    parsing the dialogue, same as _compute_zone_connections's gate-cast
+    exclusion. Shared by _compute_zone_translocators (for display) and
+    _compute_zone_connections (to exclude these from the walkable-
+    connection graph -- a translocator ride isn't a walkable path either).
+    """
+    conn = db.get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT ev.character_id, ev.ts, ev.target_name AS translocator, "
+                f"{_base_zone_expr()} AS from_zone "
+                "FROM events ev JOIN games g ON ev.game_id=g.id "
+                "WHERE ev.event_type='hail' AND g.code=%s AND ev.target_name LIKE %s",
+                (game, "Translocator %"),
+            )
+            hails = cur.fetchall()
+
+            cur.execute(
+                "SELECT ev.character_id, ev.ts, "
+                "JSON_UNQUOTE(JSON_EXTRACT(ev.extra,'$.base_zone')) AS zone "
+                "FROM events ev JOIN games g ON ev.game_id=g.id "
+                "WHERE ev.event_type='zone_change' AND g.code=%s",
+                (game,),
+            )
+            zone_changes = cur.fetchall()
+    finally:
+        conn.close()
+
+    zc_by_char = {}
+    for zc in zone_changes:
+        zc_by_char.setdefault(zc["character_id"], []).append(zc)
+    for lst in zc_by_char.values():
+        lst.sort(key=lambda r: r["ts"])
+
+    routes = []
+    for h in hails:
+        for zc in zc_by_char.get(h["character_id"], []):
+            gap = (zc["ts"] - h["ts"]).total_seconds()
+            if gap < 0:
+                continue
+            if gap <= GATE_EXCLUSION_WINDOW_S:
+                routes.append({
+                    "translocator": h["translocator"], "character_id": h["character_id"],
+                    "from_zone": h["from_zone"], "to_zone": zc["zone"],
+                    "hail_ts": h["ts"], "zone_ts": zc["ts"],
+                })
+            break  # only the next zone_change after this hail matters
+    return routes
+
+
+def _compute_zone_translocators(game):
+    """(translocator, from_zone, to_zone, times, last_seen) -- translocators
+    seen standing in from_zone and where hailing them actually sent you,
+    aggregated across every confirmed real trip. See _translocator_routes."""
+    pairs = {}
+    for r in _translocator_routes(game):
+        key = (r["translocator"], r["from_zone"], r["to_zone"])
+        entry = pairs.setdefault(key, {
+            "translocator": r["translocator"], "from_zone": r["from_zone"], "to_zone": r["to_zone"],
+            "times": 0, "last_seen": r["hail_ts"],
+        })
+        entry["times"] += 1
+        entry["last_seen"] = max(entry["last_seen"], r["hail_ts"])
+    return sorted(pairs.values(), key=lambda r: (r["from_zone"] or "", r["translocator"]))
+
+
 def _compute_zone_connections(game):
     """(from_zone, to_zone, times, last_seen) pairs derived from consecutive
     zone_change events per character, excluding any transition where a
-    Gate/Origin cast from that character landed in the GATE_EXCLUSION_WINDOW_S
-    before it -- a teleport isn't a walkable connection. Both zones are base
-    zones (tiered instance variants collapse together, same as _compute_zone_list).
+    Gate/Origin cast or a translocator hail from that character landed in
+    the GATE_EXCLUSION_WINDOW_S before it -- neither is a walkable
+    connection (translocators get their own section -- see
+    _compute_zone_translocators). Both zones are base zones (tiered
+    instance variants collapse together, same as _compute_zone_list).
 
     The gate-exclusion check used to be a correlated `NOT EXISTS` subquery in
     SQL -- correct, but ~100x slower than this in practice: MariaDB doesn't
@@ -944,8 +1114,12 @@ def _compute_zone_connections(game):
     for gc in gate_casts:
         gate_by_char.setdefault(gc["character_id"], []).append(gc["ts"])
 
+    translocated_zone_ts = {(r["character_id"], r["zone_ts"]) for r in _translocator_routes(game)}
+
     pairs = {}
     for tr in transitions:
+        if (tr["character_id"], tr["ts"]) in translocated_zone_ts:
+            continue
         char_casts = gate_by_char.get(tr["character_id"], [])
         gated = any(
             0 <= (tr["ts"] - cast_ts).total_seconds() <= GATE_EXCLUSION_WINDOW_S
@@ -1093,11 +1267,13 @@ def zoneinfo_list_eq2(request: Request):
 def _render_zoneinfo_detail(request, game, game_label, zone, tier, solo):
     detail = _compute_zone_detail(game, zone, tier, solo)
     connections = _compute_zone_connections(game)
+    translocators = _compute_zone_translocators(game)
     return templates.TemplateResponse(request, "zoneinfo_detail.html", {
         "game": game, "game_label": game_label, "zone": zone,
         "tier": tier, "solo": solo,
         "in_from": [c for c in connections if c["to_zone"] == zone],
         "out_to": [c for c in connections if c["from_zone"] == zone],
+        "translocators_here": [t for t in translocators if t["from_zone"] == zone],
         **detail,
     })
 
@@ -1262,14 +1438,20 @@ def _compute_npc_detail(game, name, tier="all"):
         conn.close()
 
     dialogue = _compute_dialogue(game, character="", npc=name, zone="")
-    # Best-effort "quest begun/ended" markers -- there's no logged turn-in
-    # action for classic EQ (see the quest-dialogue feature's known gaps),
-    # so this is a heuristic, not real quest tracking: first hail/dialogue
-    # contact vs the most recent reward received from this NPC.
-    contact_rows = [r for r in dialogue if r["kind"] in ("hail", "npc_dialogue")]
-    reward_rows = [r for r in dialogue if r["kind"] == "reward"]
+    # Best-effort "quest begun/ended" markers -- classic EQ rarely logs a
+    # turn-in action at all (only one confirmed real example exists across
+    # a 425k-line log: "You offered 1 Letter For Doug to Doug." / "You
+    # complete the trade with Doug." -- see h_item_offer/h_trade_complete),
+    # so this stays a heuristic, not guaranteed quest tracking. "ended"
+    # prefers trade_complete over reward where both exist -- a completed
+    # trade is a stronger/more direct completion signal than a reward, and
+    # is the ONLY signal at all when the actual reward was XP/faction
+    # rather than an item/currency `reward` event (confirmed: the one real
+    # trade found gave experience, not a reward line).
+    contact_rows = [r for r in dialogue if r["kind"] in ("hail", "npc_dialogue", "item_offer")]
+    ended_rows = [r for r in dialogue if r["kind"] in ("reward", "trade_complete")]
     quest_begun_at = min((r["ts"] for r in contact_rows), default=None)
-    quest_ended_at = max((r["ts"] for r in reward_rows), default=None)
+    quest_ended_at = max((r["ts"] for r in ended_rows), default=None)
 
     suggested_type = _suggest_npc_type(name, {"vendor": is_vendor})
     return {
