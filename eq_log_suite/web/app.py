@@ -1,8 +1,10 @@
 import json
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -10,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from eq_log_suite import db
+from eq_log_suite.parsers.base import GameParser
 
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parent.parent
@@ -319,14 +322,36 @@ def gathering_new_era(name: str = Form(...), note: str = Form(""), game: str = F
 
 
 def _compute_loot(game, npc="", item="", zone=""):
-    having_clauses, having_params = [], []
-    if zone:
-        having_clauses.append("zone LIKE %s"); having_params.append(f"%{zone}%")
+    # /loot used to render the *entire* zone->npc->item drop table
+    # unconditionally (~0.7s of correlated zone lookups over every loot/
+    # death event, every single page load) now that /zoneinfo covers
+    # per-zone browsing and each NPC's own page covers per-npc browsing --
+    # this is search-only now (see the two routes below, which just don't
+    # call this at all with no filters given). npc/item filters are pushed
+    # into loot_events' WHERE (not a post-aggregation HAVING) so a real
+    # search also does meaningfully less correlated zone-lookup work, not
+    # just skip the no-filter case: e.g. searching one item name only
+    # correlates zone for the handful of loot rows matching that name, not
+    # all ~1800. kills is restricted to just the npcs loot_events actually
+    # produced, for the same reason -- chance% never needs a kill count for
+    # an npc with no matching loot row.
+    #
+    # Future extension point: once items have a curated type (trash/quest/
+    # tradeskill/weapon slot+type/armor slot+type -- not built yet), that'd
+    # join in here (e.g. an `item_info` table keyed on item name, same
+    # shape as node_tiers/npc_info/zone_info) and surface as a filter/column
+    # alongside npc/item/zone.
+    loot_clauses, loot_params = ["ev.event_type='loot'", "g.code = %s"], [game]
     if npc:
-        having_clauses.append("npc LIKE %s"); having_params.append(f"%{npc}%")
+        loot_clauses.append("ev.source_name LIKE %s"); loot_params.append(f"%{npc}%")
     if item:
-        having_clauses.append("item LIKE %s"); having_params.append(f"%{item}%")
-    having = f"HAVING {' AND '.join(having_clauses)}" if having_clauses else ""
+        loot_clauses.append("ev.target_name LIKE %s"); loot_params.append(f"%{item}%")
+
+    zone_where = ""
+    zone_params = []
+    if zone:
+        zone_where = "WHERE zone LIKE %s"
+        zone_params = [f"%{zone}%"]
 
     sql = (
         # Drop chance needs kills as the denominator -- not every kill drops
@@ -334,71 +359,104 @@ def _compute_loot(game, npc="", item="", zone=""):
         # to "how many times did I kill it". Unlike gathering, loot quantity
         # isn't a small set of fixed tiers -- just average it per (zone, npc, item).
         # zone isn't stated on the loot/death line itself -- correlate against
-        # the most recent zone_change for that character, same technique
-        # /gathering and /quests already use. Zone is a real grouping level
-        # here (not just a hint) since the page is organized zone -> npc ->
-        # item, so kills are correlated to zone too (a null-safe join, <=>,
-        # since a kill/drop before any zone_change is logged has zone=NULL).
-        "WITH kills AS ("
-        "  SELECT ev.target_name AS npc, "
-        f"         {_ZONE_LOOKUP_EXPR} AS zone, "
-        "         COUNT(*) AS kill_count "
-        "  FROM events ev JOIN games g ON ev.game_id=g.id JOIN characters c ON ev.character_id=c.id "
-        "  WHERE ev.event_type='death' AND ev.source_type='you' AND g.code = %s "
-        "  GROUP BY ev.target_name, zone"
-        "), loot_events AS ("
+        # the most recent zone_change for that character. Uses base_zone
+        # (_base_zone_expr, same as /zoneinfo), not the raw tiered string
+        # (_ZONE_LOOKUP_EXPR, used by /gathering/EQ2-quests) -- results here
+        # link out to /zoneinfo/{game}/detail?zone=..., which is keyed on
+        # base zone, so this has to match or the links would 404. Kills are
+        # correlated to zone too (a null-safe join, <=>, since a kill/drop
+        # before any zone_change is logged has zone=NULL).
+        "WITH loot_events AS ("
         "  SELECT ev.source_name AS npc, ev.target_name AS item, ev.amount AS qty, "
-        f"         {_ZONE_LOOKUP_EXPR} AS zone "
+        f"         {_base_zone_expr()} AS zone "
         "  FROM events ev JOIN games g ON ev.game_id=g.id JOIN characters c ON ev.character_id=c.id "
-        "  WHERE ev.event_type='loot' AND g.code = %s"
+        f"  WHERE {' AND '.join(loot_clauses)}"
         "), loot_grouped AS ("
         "  SELECT npc, zone, item, ROUND(AVG(qty), 1) AS avg_qty, COUNT(*) AS drops "
         "  FROM loot_events GROUP BY npc, zone, item"
+        "), kills AS ("
+        "  SELECT ev.target_name AS npc, "
+        f"         {_base_zone_expr()} AS zone, "
+        "         COUNT(*) AS kill_count "
+        "  FROM events ev JOIN games g ON ev.game_id=g.id JOIN characters c ON ev.character_id=c.id "
+        "  WHERE ev.event_type='death' AND ev.source_type='you' AND g.code = %s "
+        "    AND ev.target_name IN (SELECT DISTINCT npc FROM loot_events) "
+        "  GROUP BY ev.target_name, zone"
         ") "
-        "SELECT lg.zone, lg.npc, lg.item, lg.avg_qty, lg.drops, k.kill_count, "
-        "ROUND(lg.drops / k.kill_count * 100, 2) AS chance_pct "
-        "FROM loot_grouped lg LEFT JOIN kills k ON k.npc = lg.npc AND k.zone <=> lg.zone "
-        f"{having} ORDER BY lg.zone, lg.npc, chance_pct DESC"
+        "SELECT * FROM ("
+        "  SELECT lg.zone, lg.npc, lg.item, lg.avg_qty, lg.drops, k.kill_count, "
+        "  ROUND(lg.drops / k.kill_count * 100, 2) AS chance_pct "
+        "  FROM loot_grouped lg LEFT JOIN kills k ON k.npc = lg.npc AND k.zone <=> lg.zone"
+        ") t "
+        f"{zone_where} ORDER BY item, chance_pct DESC"
     )
 
     conn = db.get_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute(sql, (game, game) + tuple(having_params))
+            cur.execute(sql, loot_params + [game] + zone_params)
             rows = cur.fetchall()
+
+            # Level (from /con) as appropriate, per npc -- same source as
+            # each NPC's own page, just fetched once here rather than
+            # correlated per loot row. Matched case-insensitively: classic
+            # EQ's own text casing for the same mob name varies by message
+            # template (con lines are sentence-initial, "A dry bone
+            # skeleton"; loot/death lines are mid-sentence, "a dry bone
+            # skeleton") -- confirmed real, not a parsing bug, so the join
+            # has to tolerate it or the level would silently never show.
+            levels_by_npc = {}
+            if rows:
+                cur.execute(
+                    "SELECT ev.source_name AS npc, MIN(ev.amount) AS level_min, MAX(ev.amount) AS level_max "
+                    "FROM events ev JOIN games g ON ev.game_id=g.id "
+                    "WHERE ev.event_type='con' AND g.code=%s GROUP BY ev.source_name",
+                    (game,),
+                )
+                levels_by_npc = {r["npc"].lower(): r for r in cur.fetchall()}
     finally:
         conn.close()
 
-    # groupby() in the template re-sorts by zone then npc -- None (a kill/drop
-    # before any zone_change was ever logged) can't be ordered against itself,
-    # so normalize to a sortable placeholder here rather than at render time.
+    # groupby() in the template re-sorts by item then zone -- None (a
+    # kill/drop before any zone_change was ever logged) can't be ordered
+    # against itself, so normalize to a sortable placeholder here rather
+    # than at render time.
     for r in rows:
         r["zone"] = r["zone"] or "(unknown zone)"
         r["npc"] = r["npc"] or "(unknown npc)"
+        lvl = levels_by_npc.get(r["npc"].lower())
+        r["level"] = None
+        if lvl and lvl["level_min"] is not None:
+            r["level"] = (
+                str(lvl["level_min"]) if lvl["level_min"] == lvl["level_max"]
+                else f'{lvl["level_min"]}-{lvl["level_max"]}'
+            )
     return rows
 
 
 @app.get("/loot/eql", response_class=HTMLResponse)
 def loot_report_eql(request: Request, npc: str = "", item: str = "", zone: str = ""):
-    rows = _compute_loot("eql", npc, item, zone)
+    rows = _compute_loot("eql", npc, item, zone) if (npc or item or zone) else []
     return templates.TemplateResponse(request, "loot.html", {
         "rows": rows,
         "game": "eql",
         "game_label": "EQ Legends",
         "unresolved_zone_starts": _unresolved_zone_starts("eql"),
         "filters": {"npc": npc, "item": item, "zone": zone},
+        "searched": bool(npc or item or zone),
     })
 
 
 @app.get("/loot/eq2", response_class=HTMLResponse)
 def loot_report_eq2(request: Request, npc: str = "", item: str = "", zone: str = ""):
-    rows = _compute_loot("eq2", npc, item, zone)
+    rows = _compute_loot("eq2", npc, item, zone) if (npc or item or zone) else []
     return templates.TemplateResponse(request, "loot.html", {
         "rows": rows,
         "game": "eq2",
         "game_label": "EverQuest II",
         "unresolved_zone_starts": _unresolved_zone_starts("eq2"),
         "filters": {"npc": npc, "item": item, "zone": zone},
+        "searched": bool(npc or item or zone),
     })
 
 
@@ -446,13 +504,91 @@ def _compute_quests(game, character="", quest="", zone="", npc=""):
         conn.close()
 
 
+_CURRENCY_TEXT_RE = re.compile(r"^[\d,]+\s*(platinum|gold|silver|copper)\b", re.IGNORECASE)
+
+
+def _compute_dialogue(game, character="", npc="", zone=""):
+    # Classic EQ quests aren't structured turn-ins like EQ2's -- they're
+    # branching NPC dialogue (bracketed [keywords] you echo back) plus
+    # whatever you're handed in return. There's no logged "give item to
+    # NPC" action at all (confirmed empty across a 425k-line real log), so
+    # this can't produce a single "quest completed" row the way EQ2's does;
+    # instead it's a flat chronological transcript of hail/say/npc_dialogue/
+    # reward events, filterable by npc/zone, so a real dialogue tree emerges
+    # from repeated visits over time. zone is correlated the same way
+    # /loot, /gathering, and EQ2's /quests already do.
+    inner_clauses, inner_params = ["g.code = %s"], [game]
+    if character:
+        inner_clauses.append("c.name = %s"); inner_params.append(character)
+    inner_where = f"AND {' AND '.join(inner_clauses)}"
+
+    outer_clauses, outer_params = [], []
+    if npc:
+        outer_clauses.append("npc LIKE %s"); outer_params.append(f"%{npc}%")
+    if zone:
+        outer_clauses.append("zone LIKE %s"); outer_params.append(f"%{zone}%")
+    outer_where = f"WHERE {' AND '.join(outer_clauses)}" if outer_clauses else ""
+
+    def branch(event_type, npc_expr, text_expr):
+        return (
+            "SELECT ev.ts, c.name AS character_name, ev.event_type AS kind, "
+            f"{npc_expr} AS npc, {text_expr} AS text, "
+            f"{_ZONE_LOOKUP_EXPR} AS zone "
+            "FROM events ev JOIN games g ON ev.game_id=g.id JOIN characters c ON ev.character_id=c.id "
+            f"WHERE ev.event_type='{event_type}' {inner_where}"
+        )
+
+    sql = (
+        "SELECT * FROM ("
+        + branch("hail", "ev.target_name", "NULL") + " UNION ALL "
+        + branch("say", "NULL", "JSON_UNQUOTE(JSON_EXTRACT(ev.extra,'$.text'))") + " UNION ALL "
+        + branch("npc_dialogue", "ev.source_name", "JSON_UNQUOTE(JSON_EXTRACT(ev.extra,'$.text'))") + " UNION ALL "
+        + branch("reward", "ev.source_name", "JSON_UNQUOTE(JSON_EXTRACT(ev.extra,'$.text'))")
+        + ") t "
+        + f"{outer_where} ORDER BY character_name, ts"
+    )
+
+    conn = db.get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (inner_params * 4) + outer_params)
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    # Collapse repeats of the exact same line (everything but ts) -- e.g. a
+    # generic mob's canned bark ("A grikbar kobold says, 'Grrrrr...'")
+    # showing up dozens of times is noise, not a new dialogue-tree branch.
+    # Rows are already ordered by character_name, ts, so the first time a
+    # key is seen is its earliest occurrence; keep that one.
+    seen = set()
+    deduped = []
+    for r in rows:
+        key = (r["character_name"], r["kind"], r["npc"], r["zone"], r["text"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(r)
+    rows = deduped
+
+    # A reward whose text doesn't read as a currency amount is (once bare
+    # item-reward parsing exists -- see h_npc_reward's known gaps) an item
+    # name, worth linking to the loot report so you can see every mob/zone
+    # that item drops from elsewhere, rather than tracking that separately.
+    for r in rows:
+        r["loot_link"] = None
+        if r["kind"] == "reward" and r["text"] and not _CURRENCY_TEXT_RE.match(r["text"]):
+            r["loot_link"] = f"/loot/{game}?item={quote(r['text'])}"
+    return rows
+
+
 @app.get("/quests/eql", response_class=HTMLResponse)
-def quests_report_eql(request: Request, character: str = "", quest: str = "", zone: str = "", npc: str = ""):
-    rows = _compute_quests("eql", character, quest, zone, npc)
-    return templates.TemplateResponse(request, "quests.html", {
+def quests_report_eql(request: Request, character: str = "", npc: str = "", zone: str = ""):
+    rows = _compute_dialogue("eql", character, npc, zone)
+    return templates.TemplateResponse(request, "dialogue.html", {
         "rows": rows, "game": "eql", "game_label": "EQ Legends",
         "unresolved_zone_starts": _unresolved_zone_starts("eql"),
-        "filters": {"character": character, "quest": quest, "zone": zone, "npc": npc},
+        "filters": {"character": character, "npc": npc, "zone": zone},
     })
 
 
@@ -648,6 +784,560 @@ def zones_report_eq2(request: Request, character: str = ""):
         "rows": rows, "game": "eq2", "game_label": "EverQuest II",
         "filters": {"character": character},
     })
+
+
+GATE_SPELLS = ("Gate", "Origin")
+GATE_EXCLUSION_WINDOW_S = 60  # see plan notes: real gate/origin casts land the
+# resulting zone_change 9-41s later in the actual log; anything beyond that
+# observed in the data is clearly an unrelated later zone change, not caused
+# by that cast.
+
+
+def _base_zone_expr(alias="ev"):
+    # Every zone_change event already carries base_zone/tier/solo in its own
+    # `extra` (see parse_zone_tier() in eq_legends.py) -- this correlates any
+    # OTHER event (con, npc_dialogue, loot, ...) to whichever zone_change
+    # happened most recently before it, same "most recent prior row"
+    # technique as _ZONE_LOOKUP_EXPR, but resolving to the base zone name
+    # (e.g. "Permafrost Keep") rather than the raw tiered string (e.g.
+    # "Permafrost Keep 4 (Refined)") so instance variants of the same zone
+    # aggregate together on the Zone Info pages.
+    return (
+        "(SELECT JSON_UNQUOTE(JSON_EXTRACT(z.extra,'$.base_zone')) FROM events z "
+        f"WHERE z.event_type='zone_change' AND z.character_id={alias}.character_id "
+        f"AND z.ts<={alias}.ts ORDER BY z.ts DESC LIMIT 1)"
+    )
+
+
+def _tier_solo_exprs(alias="ev"):
+    # tier/solo from the same "most recent zone_change" correlation as
+    # _base_zone_expr, kept as independent correlated subqueries rather than
+    # one combined lookup for simplicity -- in practice a character's
+    # zone_change rows are never close enough in time for the
+    # ORDER BY ts DESC LIMIT 1 tie-break to matter.
+    tier = (
+        "(SELECT JSON_EXTRACT(z.extra,'$.tier') FROM events z "
+        f"WHERE z.event_type='zone_change' AND z.character_id={alias}.character_id "
+        f"AND z.ts<={alias}.ts ORDER BY z.ts DESC LIMIT 1)"
+    )
+    solo = (
+        "(SELECT JSON_EXTRACT(z.extra,'$.solo') FROM events z "
+        f"WHERE z.event_type='zone_change' AND z.character_id={alias}.character_id "
+        f"AND z.ts<={alias}.ts ORDER BY z.ts DESC LIMIT 1)"
+    )
+    return tier, solo
+
+
+def _compute_zone_list(game):
+    # Computes base_zone once per matching con/npc_dialogue row (via a
+    # single GROUP BY query) rather than once per (zone, row) pair via a
+    # per-zone loop -- the previous per-zone-loop version measured ~33s for
+    # 50 zones (each zone re-scanning and re-correlating every con/dialogue
+    # row from scratch); this version is under a second. See
+    # _compute_zone_connections's docstring for the same lesson applied to
+    # the gate-exclusion check.
+    conn = db.get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT JSON_UNQUOTE(JSON_EXTRACT(e.extra,'$.base_zone')) AS zone "
+                "FROM events e JOIN games g ON e.game_id=g.id "
+                "WHERE e.event_type='zone_change' AND g.code=%s",
+                (game,),
+            )
+            zones = sorted(r["zone"] for r in cur.fetchall() if r["zone"])
+
+            cur.execute(
+                "SELECT zone, MIN(level) AS level_min, MAX(level) AS level_max, "
+                "COUNT(DISTINCT CASE WHEN rare THEN source_name END) AS rare_count FROM ("
+                "  SELECT ev.source_name, ev.amount AS level, "
+                "    JSON_EXTRACT(ev.extra,'$.rare')=true AS rare, "
+                f"    {_base_zone_expr()} AS zone "
+                "  FROM events ev JOIN games g ON ev.game_id=g.id "
+                "  WHERE ev.event_type='con' AND g.code=%s"
+                ") t WHERE zone IS NOT NULL GROUP BY zone",
+                (game,),
+            )
+            con_by_zone = {r["zone"]: r for r in cur.fetchall()}
+
+            cur.execute(
+                "SELECT zone, COUNT(DISTINCT source_name) AS npc_count FROM ("
+                "  SELECT ev.source_name, "
+                f"    {_base_zone_expr()} AS zone "
+                "  FROM events ev JOIN games g ON ev.game_id=g.id "
+                "  WHERE ev.event_type IN ('con','npc_dialogue') AND g.code=%s"
+                ") t WHERE zone IS NOT NULL GROUP BY zone",
+                (game,),
+            )
+            npc_by_zone = {r["zone"]: r["npc_count"] for r in cur.fetchall()}
+
+            cur.execute("SELECT zone, level_min_override, level_max_override, note FROM zone_info")
+            overrides = {r["zone"]: r for r in cur.fetchall()}
+    finally:
+        conn.close()
+
+    rows = []
+    for zone in zones:
+        con_stats = con_by_zone.get(zone, {})
+        override = overrides.get(zone)
+        level_min = con_stats.get("level_min")
+        level_max = con_stats.get("level_max")
+        if override:
+            if override["level_min_override"] is not None:
+                level_min = override["level_min_override"]
+            if override["level_max_override"] is not None:
+                level_max = override["level_max_override"]
+        rows.append({
+            "zone": zone,
+            "level_min": level_min,
+            "level_max": level_max,
+            "npc_count": npc_by_zone.get(zone, 0),
+            "rare_count": con_stats.get("rare_count") or 0,
+            "note": override["note"] if override else None,
+        })
+    return rows
+
+
+def _compute_zone_connections(game):
+    """(from_zone, to_zone, times, last_seen) pairs derived from consecutive
+    zone_change events per character, excluding any transition where a
+    Gate/Origin cast from that character landed in the GATE_EXCLUSION_WINDOW_S
+    before it -- a teleport isn't a walkable connection. Both zones are base
+    zones (tiered instance variants collapse together, same as _compute_zone_list).
+
+    The gate-exclusion check used to be a correlated `NOT EXISTS` subquery in
+    SQL -- correct, but ~100x slower than this in practice: MariaDB doesn't
+    materialize the small Gate/Origin-cast CTE it's checked against, so it
+    re-scans the *whole* events table's spell_cast rows once per zone
+    transition (measured 5.67s here vs 0.06s below). Both the transition
+    list and the cast list are tiny (hundreds of rows, not hundreds of
+    thousands), so doing the exclusion check as a plain Python loop over
+    two already-fetched lists is both correct and dramatically faster.
+    """
+    conn = db.get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "WITH zone_seq AS ("
+                "  SELECT e.character_id, e.ts, "
+                "    JSON_UNQUOTE(JSON_EXTRACT(e.extra,'$.base_zone')) AS zone, "
+                "    LAG(JSON_UNQUOTE(JSON_EXTRACT(e.extra,'$.base_zone'))) OVER (PARTITION BY e.character_id ORDER BY e.ts) AS prev_zone "
+                "  FROM events e JOIN games g ON e.game_id=g.id "
+                "  WHERE e.event_type='zone_change' AND g.code=%s"
+                ") "
+                "SELECT character_id, ts, zone, prev_zone FROM zone_seq "
+                "WHERE prev_zone IS NOT NULL AND prev_zone <> zone",
+                (game,),
+            )
+            transitions = cur.fetchall()
+
+            cur.execute(
+                "SELECT ev.character_id, ev.ts FROM events ev JOIN games g ON ev.game_id=g.id "
+                "WHERE ev.event_type='spell_cast' AND ev.source_type='you' AND ev.verb IN (%s,%s) AND g.code=%s",
+                GATE_SPELLS + (game,),
+            )
+            gate_casts = cur.fetchall()
+    finally:
+        conn.close()
+
+    gate_by_char = {}
+    for gc in gate_casts:
+        gate_by_char.setdefault(gc["character_id"], []).append(gc["ts"])
+
+    pairs = {}
+    for tr in transitions:
+        char_casts = gate_by_char.get(tr["character_id"], [])
+        gated = any(
+            0 <= (tr["ts"] - cast_ts).total_seconds() <= GATE_EXCLUSION_WINDOW_S
+            for cast_ts in char_casts
+        )
+        if gated:
+            continue
+        key = (tr["prev_zone"], tr["zone"])
+        entry = pairs.setdefault(key, {"from_zone": key[0], "to_zone": key[1], "times": 0, "last_seen": tr["ts"]})
+        entry["times"] += 1
+        entry["last_seen"] = max(entry["last_seen"], tr["ts"])
+
+    return sorted(pairs.values(), key=lambda r: (r["from_zone"], -r["times"]))
+
+
+def _compute_zone_detail(game, zone, tier="all", solo="any"):
+    tier_expr, solo_expr = _tier_solo_exprs()
+    match_clauses, match_params = [f"{_base_zone_expr()} = %s"], [zone]
+    if tier != "all":
+        match_clauses.append(f"COALESCE({tier_expr}, 0) = %s"); match_params.append(int(tier))
+    if solo != "any":
+        match_clauses.append(f"COALESCE({solo_expr}, false) = %s"); match_params.append(solo == "1")
+    match_where = " AND ".join(match_clauses)
+
+    conn = db.get_connection()
+    try:
+        with conn.cursor() as cur:
+            # tiers/solo actually observed for this zone, to build the toggle UI.
+            # These are read directly off each zone_change's own extra (no
+            # correlation needed -- unlike tier_expr/solo_expr above, which
+            # look up the most recent zone_change *before* some other event).
+            cur.execute(
+                "SELECT DISTINCT JSON_EXTRACT(e.extra,'$.tier') AS tier, "
+                "JSON_UNQUOTE(JSON_EXTRACT(e.extra,'$.tier_label')) AS tier_label, "
+                "JSON_EXTRACT(e.extra,'$.solo') AS solo "
+                "FROM events e JOIN games g ON e.game_id=g.id "
+                "WHERE e.event_type='zone_change' AND g.code=%s "
+                "AND JSON_UNQUOTE(JSON_EXTRACT(e.extra,'$.base_zone')) = %s",
+                (game, zone),
+            )
+            variants = cur.fetchall()
+
+            # NPCs seen: con (with level/rare) and npc_dialogue key off
+            # source_name (who's conning/talking); death keys off
+            # target_name (who died -- source_name for a death event is
+            # the killer, e.g. "You", not the NPC roster we want here).
+            cur.execute(
+                "WITH zone_npc_events AS ("
+                "  SELECT ev.source_name AS npc, ev.event_type, ev.amount, ev.extra "
+                "  FROM events ev JOIN games g ON ev.game_id=g.id "
+                "  WHERE ev.event_type IN ('con','npc_dialogue') AND ev.source_name IS NOT NULL "
+                f"    AND g.code=%s AND {match_where} "
+                "  UNION ALL "
+                "  SELECT ev.target_name AS npc, ev.event_type, ev.amount, ev.extra "
+                "  FROM events ev JOIN games g ON ev.game_id=g.id "
+                "  WHERE ev.event_type='death' AND ev.target_type != 'you' AND ev.target_name IS NOT NULL "
+                f"    AND g.code=%s AND {match_where}"
+                ") "
+                "SELECT npc, "
+                "MAX(CASE WHEN event_type='con' THEN amount END) AS level, "
+                # MAX() strips JSON_EXTRACT's JSON-typed result down to a
+                # plain string ("true"/"false"), so it must be compared
+                # against the string 'true' here, not the bare keyword true
+                # (which MariaDB happily accepts directly against a raw
+                # JSON_EXTRACT() call, but silently mis-compares as 0 once
+                # MAX() has touched it -- verified against real data).
+                "MAX(CASE WHEN event_type='con' THEN JSON_EXTRACT(extra,'$.rare') END)='true' AS rare, "
+                "SUM(CASE WHEN event_type='death' THEN 1 ELSE 0 END) AS kills, "
+                "SUM(CASE WHEN event_type='npc_dialogue' THEN 1 ELSE 0 END) AS dialogue_lines "
+                "FROM zone_npc_events GROUP BY npc ORDER BY npc",
+                [game] + match_params + [game] + match_params,
+            )
+            npcs = cur.fetchall()
+
+            # loot obtained in this zone (same shape as _compute_loot, scoped to zone)
+            cur.execute(
+                "SELECT ev.source_name AS npc, ev.target_name AS item, "
+                "ROUND(AVG(ev.amount), 1) AS avg_qty, COUNT(*) AS drops "
+                "FROM events ev JOIN games g ON ev.game_id=g.id "
+                f"WHERE ev.event_type='loot' AND g.code=%s AND {match_where} "
+                "GROUP BY ev.source_name, ev.target_name ORDER BY npc, item",
+                [game] + match_params,
+            )
+            loot = cur.fetchall()
+
+            # quest/reward items (non-currency reward text) given by NPCs here
+            cur.execute(
+                "SELECT ev.source_name AS npc, "
+                "JSON_UNQUOTE(JSON_EXTRACT(ev.extra,'$.text')) AS item, ev.ts "
+                "FROM events ev JOIN games g ON ev.game_id=g.id "
+                f"WHERE ev.event_type='reward' AND g.code=%s AND {match_where} "
+                "ORDER BY ev.ts DESC",
+                [game] + match_params,
+            )
+            reward_rows = cur.fetchall()
+            quest_items = [r for r in reward_rows if r["item"] and not _CURRENCY_TEXT_RE.match(r["item"])]
+
+            # rare mobs seen here, cross-referenced with their own drops
+            # (from the loot rows already fetched above) per the user's
+            # explicit ask to be able to check a rare's drops at a glance.
+            rare_names = {n["npc"] for n in npcs if n["rare"]}
+            rares = []
+            for name in sorted(rare_names):
+                rares.append({
+                    "npc": name,
+                    "level": next((n["level"] for n in npcs if n["npc"] == name), None),
+                    "drops": [l for l in loot if l["npc"] == name],
+                })
+
+            cur.execute(
+                "SELECT level_min_override, level_max_override, note FROM zone_info WHERE zone=%s",
+                (zone,),
+            )
+            override = cur.fetchone()
+
+    finally:
+        conn.close()
+
+    return {
+        "variants": variants,
+        "npcs": npcs,
+        "loot": loot,
+        "quest_items": quest_items,
+        "rares": rares,
+        "override": override,
+    }
+
+
+@app.get("/zoneinfo/eql", response_class=HTMLResponse)
+def zoneinfo_list_eql(request: Request):
+    rows = _compute_zone_list("eql")
+    return templates.TemplateResponse(request, "zoneinfo_list.html", {
+        "rows": rows, "game": "eql", "game_label": "EQ Legends",
+    })
+
+
+@app.get("/zoneinfo/eq2", response_class=HTMLResponse)
+def zoneinfo_list_eq2(request: Request):
+    rows = _compute_zone_list("eq2")
+    return templates.TemplateResponse(request, "zoneinfo_list.html", {
+        "rows": rows, "game": "eq2", "game_label": "EverQuest II",
+    })
+
+
+def _render_zoneinfo_detail(request, game, game_label, zone, tier, solo):
+    detail = _compute_zone_detail(game, zone, tier, solo)
+    connections = _compute_zone_connections(game)
+    return templates.TemplateResponse(request, "zoneinfo_detail.html", {
+        "game": game, "game_label": game_label, "zone": zone,
+        "tier": tier, "solo": solo,
+        "in_from": [c for c in connections if c["to_zone"] == zone],
+        "out_to": [c for c in connections if c["from_zone"] == zone],
+        **detail,
+    })
+
+
+@app.get("/zoneinfo/eql/detail", response_class=HTMLResponse)
+def zoneinfo_detail_eql(request: Request, zone: str, tier: str = "all", solo: str = "any"):
+    return _render_zoneinfo_detail(request, "eql", "EQ Legends", zone, tier, solo)
+
+
+@app.get("/zoneinfo/eq2/detail", response_class=HTMLResponse)
+def zoneinfo_detail_eq2(request: Request, zone: str, tier: str = "all", solo: str = "any"):
+    return _render_zoneinfo_detail(request, "eq2", "EverQuest II", zone, tier, solo)
+
+
+@app.post("/zoneinfo/set-level")
+def zoneinfo_set_level(
+    zone: str = Form(...), level_min: str = Form(""), level_max: str = Form(""),
+    note: str = Form(""), game: str = Form("eql"),
+):
+    conn = db.get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO zone_info (zone, level_min_override, level_max_override, note) "
+                "VALUES (%s,%s,%s,%s) "
+                "ON DUPLICATE KEY UPDATE level_min_override=VALUES(level_min_override), "
+                "level_max_override=VALUES(level_max_override), note=VALUES(note)",
+                (zone, level_min or None, level_max or None, note or None),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return RedirectResponse(f"/zoneinfo/{game}/detail?zone={quote(zone)}", status_code=303)
+
+
+def _suggest_npc_type(name, rare_or_vendor_stats):
+    if rare_or_vendor_stats["vendor"]:
+        return "vendor"
+    if re.match(r"^(a|an|the)\s", name.strip(), re.IGNORECASE):
+        return "mob"
+    return "npc"
+
+
+def _compute_npc_list(game, search=""):
+    sql = (
+        "WITH npc_events AS ("
+        "  SELECT ev.source_name AS npc, ev.event_type, ev.amount, ev.extra "
+        "  FROM events ev JOIN games g ON ev.game_id=g.id "
+        "  WHERE g.code=%s AND ev.event_type IN ('con','npc_dialogue','vendor_buy','vendor_sell','loot') "
+        "    AND ev.source_name IS NOT NULL "
+        "  UNION ALL "
+        "  SELECT ev.target_name AS npc, ev.event_type, ev.amount, ev.extra "
+        "  FROM events ev JOIN games g ON ev.game_id=g.id "
+        "  WHERE g.code=%s AND ev.event_type='death' AND ev.target_name IS NOT NULL AND ev.target_type != 'you'"
+        ") "
+        "SELECT npc, "
+        "  MIN(CASE WHEN event_type='con' THEN amount END) AS level_min, "
+        "  MAX(CASE WHEN event_type='con' THEN amount END) AS level_max, "
+        "  MAX(CASE WHEN event_type='con' THEN JSON_EXTRACT(extra,'$.rare') END) = 'true' AS rare, "
+        "  (SUM(CASE WHEN event_type IN ('vendor_buy','vendor_sell') THEN 1 ELSE 0 END) > 0) AS vendor, "
+        "  SUM(CASE WHEN event_type='npc_dialogue' THEN 1 ELSE 0 END) AS dialogue_lines, "
+        "  SUM(CASE WHEN event_type='death' THEN 1 ELSE 0 END) AS kills "
+        "FROM npc_events GROUP BY npc"
+    )
+    params = [game, game]
+    if search:
+        sql += " HAVING npc LIKE %s"
+        params.append(f"%{search}%")
+    sql += " ORDER BY npc"
+
+    conn = db.get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+            names = [r["npc"] for r in rows]
+            overrides = {}
+            if names:
+                fmt = ",".join(["%s"] * len(names))
+                cur.execute(f"SELECT npc, npc_type, note FROM npc_info WHERE npc IN ({fmt})", names)
+                overrides = {r["npc"]: r for r in cur.fetchall()}
+    finally:
+        conn.close()
+
+    for r in rows:
+        override = overrides.get(r["npc"])
+        r["suggested_type"] = _suggest_npc_type(r["npc"], r)
+        r["npc_type"] = (override["npc_type"] if override and override["npc_type"] else r["suggested_type"])
+        r["note"] = override["note"] if override else None
+    return rows
+
+
+def _compute_npc_detail(game, name, tier="all"):
+    tier_expr, _ = _tier_solo_exprs()
+    conn = db.get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT " + _base_zone_expr() + " AS zone "
+                "FROM events ev JOIN games g ON ev.game_id=g.id "
+                "WHERE g.code=%s AND ((ev.source_name=%s AND ev.event_type IN ('con','npc_dialogue','loot','vendor_buy','vendor_sell')) "
+                "  OR (ev.target_name=%s AND ev.event_type='death' AND ev.target_type != 'you'))",
+                (game, name, name),
+            )
+            zones = sorted(r["zone"] for r in cur.fetchall() if r["zone"])
+
+            # Tiers this NPC's loot has actually been seen in, to build the
+            # loot pulldown -- same "collapse instance variants, toggle
+            # separately" idea as the zone detail page's tier toggle.
+            cur.execute(
+                f"SELECT DISTINCT {tier_expr} AS tier, "
+                "JSON_UNQUOTE(JSON_EXTRACT((SELECT z.extra FROM events z WHERE z.event_type='zone_change' "
+                "  AND z.character_id=ev.character_id AND z.ts<=ev.ts ORDER BY z.ts DESC LIMIT 1),'$.tier_label')) AS tier_label "
+                "FROM events ev JOIN games g ON ev.game_id=g.id "
+                "WHERE g.code=%s AND ev.event_type='loot' AND ev.source_name=%s",
+                (game, name),
+            )
+            loot_tiers = cur.fetchall()
+
+            loot_clauses, loot_params = ["ev.event_type='loot'", "ev.source_name=%s"], [name]
+            if tier != "all":
+                loot_clauses.append(f"COALESCE({tier_expr}, 0) = %s"); loot_params.append(int(tier))
+            cur.execute(
+                "SELECT ev.target_name AS item, ROUND(AVG(ev.amount),1) AS avg_qty, COUNT(*) AS drops "
+                "FROM events ev JOIN games g ON ev.game_id=g.id "
+                f"WHERE g.code=%s AND {' AND '.join(loot_clauses)} "
+                "GROUP BY ev.target_name ORDER BY item",
+                [game] + loot_params,
+            )
+            loot = cur.fetchall()
+
+            cur.execute(
+                "SELECT MIN(amount) AS level_min, MAX(amount) AS level_max, "
+                "MAX(JSON_EXTRACT(extra,'$.rare'))='true' AS rare "
+                "FROM events ev JOIN games g ON ev.game_id=g.id "
+                "WHERE g.code=%s AND ev.event_type='con' AND ev.source_name=%s",
+                (game, name),
+            )
+            con_stats = cur.fetchone()
+
+            cur.execute(
+                "SELECT ev.target_name AS item, ev.amount AS qty, "
+                "JSON_UNQUOTE(JSON_EXTRACT(ev.extra,'$.price_text')) AS price "
+                "FROM events ev JOIN games g ON ev.game_id=g.id "
+                "WHERE g.code=%s AND ev.event_type='vendor_buy' AND ev.source_name=%s "
+                "GROUP BY ev.target_name, ev.amount, price ORDER BY item",
+                (game, name),
+            )
+            catalog = cur.fetchall()
+            is_vendor = bool(catalog)
+            if not is_vendor:
+                cur.execute(
+                    "SELECT COUNT(*) AS n FROM events ev JOIN games g ON ev.game_id=g.id "
+                    "WHERE g.code=%s AND ev.event_type='vendor_sell' AND ev.source_name=%s",
+                    (game, name),
+                )
+                is_vendor = cur.fetchone()["n"] > 0
+
+            cur.execute("SELECT npc_type, note FROM npc_info WHERE npc=%s", (name,))
+            override = cur.fetchone()
+    finally:
+        conn.close()
+
+    dialogue = _compute_dialogue(game, character="", npc=name, zone="")
+    # Best-effort "quest begun/ended" markers -- there's no logged turn-in
+    # action for classic EQ (see the quest-dialogue feature's known gaps),
+    # so this is a heuristic, not real quest tracking: first hail/dialogue
+    # contact vs the most recent reward received from this NPC.
+    contact_rows = [r for r in dialogue if r["kind"] in ("hail", "npc_dialogue")]
+    reward_rows = [r for r in dialogue if r["kind"] == "reward"]
+    quest_begun_at = min((r["ts"] for r in contact_rows), default=None)
+    quest_ended_at = max((r["ts"] for r in reward_rows), default=None)
+
+    suggested_type = _suggest_npc_type(name, {"vendor": is_vendor})
+    return {
+        "name": name,
+        "zones": zones,
+        "level_min": con_stats["level_min"],
+        "level_max": con_stats["level_max"],
+        "rare": bool(con_stats["rare"]),
+        "vendor": is_vendor,
+        "catalog": catalog,
+        "loot": loot,
+        "loot_tiers": loot_tiers,
+        "tier": tier,
+        "dialogue": dialogue,
+        "quest_begun_at": quest_begun_at,
+        "quest_ended_at": quest_ended_at,
+        "npc_type": (override["npc_type"] if override and override["npc_type"] else suggested_type),
+        "suggested_type": suggested_type,
+        "note": override["note"] if override else None,
+    }
+
+
+@app.get("/npcs/eql", response_class=HTMLResponse)
+def npcs_list_eql(request: Request, search: str = ""):
+    rows = _compute_npc_list("eql", search)
+    return templates.TemplateResponse(request, "npc_list.html", {
+        "rows": rows, "game": "eql", "game_label": "EQ Legends", "search": search,
+    })
+
+
+@app.get("/npcs/eq2", response_class=HTMLResponse)
+def npcs_list_eq2(request: Request, search: str = ""):
+    rows = _compute_npc_list("eq2", search)
+    return templates.TemplateResponse(request, "npc_list.html", {
+        "rows": rows, "game": "eq2", "game_label": "EverQuest II", "search": search,
+    })
+
+
+@app.get("/npcs/eql/detail", response_class=HTMLResponse)
+def npc_detail_eql(request: Request, npc: str, tier: str = "all"):
+    detail = _compute_npc_detail("eql", npc, tier)
+    return templates.TemplateResponse(request, "npc_detail.html", {
+        "game": "eql", "game_label": "EQ Legends", **detail,
+    })
+
+
+@app.get("/npcs/eq2/detail", response_class=HTMLResponse)
+def npc_detail_eq2(request: Request, npc: str, tier: str = "all"):
+    detail = _compute_npc_detail("eq2", npc, tier)
+    return templates.TemplateResponse(request, "npc_detail.html", {
+        "game": "eq2", "game_label": "EverQuest II", **detail,
+    })
+
+
+@app.post("/npc-info/set")
+def npc_info_set(npc: str = Form(...), npc_type: str = Form(""), note: str = Form(""), game: str = Form("eql")):
+    conn = db.get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO npc_info (npc, npc_type, note) VALUES (%s,%s,%s) "
+                "ON DUPLICATE KEY UPDATE npc_type=VALUES(npc_type), note=VALUES(note)",
+                (npc, npc_type or None, note or None),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return RedirectResponse(f"/npcs/{game}/detail?npc={quote(npc)}", status_code=303)
 
 
 @app.get("/api/events/since/{last_id}")

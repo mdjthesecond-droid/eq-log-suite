@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}Quests -- {{ game_label }}{% endblock %}
+{% block content %}
+<h1>Quests -- {{ game_label }}</h1>
+<p>Classic EQ has no logged "quest completed" or "give item to NPC" line at all -- only NPC dialogue,
+your own spoken responses, and whatever you're handed back. This is a chronological transcript of
+those, per character, so a real dialogue tree emerges from repeated visits to the same NPC over time.
+Bracketed <code>[keywords]</code> in an NPC's line are the conversation's actual branch points -- echo
+one back with <code>/say</code> to continue. zone is whatever zone_change happened most recently
+before the line; npc is who you hailed (for a hail line) or who's speaking (for dialogue/reward
+lines) -- blank for a plain "you say" line, since text alone can't tell who you were talking to.</p>
+
+<form method="get" action="/quests/{{ game }}">
+  <input name="character" placeholder="character" value="{{ filters.character }}">
+  <input name="npc" placeholder="npc contains" value="{{ filters.npc }}">
+  <input name="zone" placeholder="zone contains" value="{{ filters.zone }}">
+  <button type="submit">Filter</button>
+</form>
+
+{% if unresolved_zone_starts %}
+<div style="border:1px solid #c9a227; border-radius:6px; padding:0.8rem 1rem; margin-bottom:1rem;">
+  <strong>&#9888; {{ unresolved_zone_starts|length }} character(s) have activity logged before their
+  first zone was ever recorded -- confirm what zone they actually started in:</strong>
+  {% for u in unresolved_zone_starts %}
+  <form method="post" action="/zone-start/set" style="display:flex; gap:0.5rem; align-items:center; margin-top:0.5rem;">
+    <input type="hidden" name="character_id" value="{{ u.character_id }}">
+    <input type="hidden" name="next" value="/quests/{{ game }}">
+    <span style="min-width:220px;">{{ u.character_name }} <span style="opacity:0.7;">(earliest: {{ u.earliest_ts }})</span></span>
+    <input name="zone" placeholder="actual zone, e.g. The Steamfont Mountains" required style="width:280px;">
+    <input name="note" placeholder="note (optional)">
+    <button type="submit">Confirm</button>
+  </form>
+  {% endfor %}
+</div>
+{% endif %}
+
+{% if not rows %}
+<p>No dialogue captured yet{% if filters.character or filters.npc or filters.zone %} matching those filters{% endif %}.</p>
+{% endif %}
+
+<div class="scroll-frame">
+<table class="sortable wrap-table">
+  <thead>
+    <tr><th>ts</th><th>character</th><th>zone</th><th>npc</th><th>line</th></tr>
+  </thead>
+  <tbody>
+    {% for r in rows %}
+    <tr>
+      <td>{{ r.ts }}</td>
+      <td>{{ r.character_name }}</td>
+      <td>{{ r.zone or '' }}</td>
+      <td>{{ r.npc or '' }}</td>
+      <td>
+        <span class="dlg-{{ r.kind }}">
+        {%- if r.kind == 'hail' -%}
+          &rarr; Hail{% if r.npc %}, {{ r.npc }}{% endif %}
+        {%- elif r.kind == 'say' -%}
+          You say, '{{ r.text }}'
+        {%- elif r.kind == 'npc_dialogue' -%}
+          <strong>{{ r.npc }}</strong> says, '{{ r.text }}'
+        {%- elif r.kind == 'reward' -%}
+          &#10003; received {% if r.loot_link %}<a href="{{ r.loot_link }}">{{ r.text }}</a>{% else %}{{ r.text }}{% endif %} from {{ r.npc }}
+        {%- endif -%}
+        </span>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endblock %}

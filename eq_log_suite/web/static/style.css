@@ -73,3 +73,9 @@ details[open] summary { margin-bottom: 0.6rem; }
 details.nested { margin: 0.6rem 0 0.6rem 1rem; background: #171a22; }
 details.nested summary { font-size: 1rem; }
 pre { white-space: pre-wrap; word-break: break-word; background: #1c1f29; padding: 0.6rem; border-radius: 4px; }
+/* /quests/eql's dialogue transcript -- color-code each line by who's
+   "speaking" so a hail/say/npc_dialogue/reward transcript reads at a
+   glance without needing the kind spelled out per row. */
+.dlg-npc_dialogue { color: var(--accent); }
+.dlg-hail { font-style: italic; opacity: 0.8; }
+.dlg-reward { color: #7fd88f; }

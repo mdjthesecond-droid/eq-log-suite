@@ -420,6 +420,159 @@ def h_currency(m):
     )
 
 
+def h_hail(m):
+    # "You say, 'Hail, Translocator Fithop'" / bare "You say, 'Hail'" (no
+    # named target -- e.g. hailing whatever you currently have targeted;
+    # text alone can't say who).
+    npc = m.group("npc")
+    return ParsedEvent(
+        ts=None, raw_line=None, event_type="hail",
+        source_name="You", source_type="you",
+        target_name=npc, target_type="npc" if npc else None,
+        verb=None, amount=None, outcome=None,
+    )
+
+
+def h_say(m):
+    # Catch-all for "You say, '...'" that isn't a hail -- this is how a
+    # quest dialogue keyword gets echoed back to an NPC (e.g. "You say,
+    # 'exiled'" in response to Kozyn Gigglephizz's "...We [exiled] him...").
+    return ParsedEvent(
+        ts=None, raw_line=None, event_type="say",
+        source_name="You", source_type="you",
+        target_name=None, target_type=None,
+        verb=None, amount=None, outcome=None,
+        extra={"text": m.group("text")},
+    )
+
+
+def h_npc_dialogue(m):
+    # "<name> says/shouts, '...'" and "<name> chortles with glee.  '...'".
+    # Confirmed real speaker/verb pairs: generic mobs and named questgivers
+    # via "says,", a scripted boss via "shouts,", a storytelling NPC via
+    # "chortles with glee.". Deliberately does NOT include "tells you," --
+    # that's classic EQ's player-to-player /tell format (e.g. "Aoth tells
+    # you, 'i used bear for a while lol its ass...'"), never NPC dialogue,
+    # even though it shares the same "<name> VERB, 'text'" shape.
+    #
+    # Caveat that can't be resolved from text alone: a proper-noun speaker
+    # here (source_type "unknown", same bucket GameParser.classify_actor
+    # already uses for melee/heal sources of ambiguous identity) could be
+    # another player's local /say chat instead of real NPC dialogue --
+    # "<name> says, '...'" is identical either way. Left for a human reading
+    # the dialogue transcript to judge from content (quest-shaped phrasing,
+    # bracketed [keywords]) rather than guessed at here.
+    npc = m.group("npc")
+    if npc.rstrip().lower().endswith("'s corpse"):
+        # Death-rattle line (e.g. "Orc centurion's corpse says, '...'"),
+        # not real dialogue -- falls through to raw_lines, nothing lost.
+        return None
+    text = m.group("text")
+    extra = {"text": text}
+    keywords = re.findall(r"\[([^\]]+)\]", text)
+    if keywords:
+        extra["keywords"] = keywords
+    return ParsedEvent(
+        ts=None, raw_line=None, event_type="npc_dialogue",
+        source_name=npc, source_type=GameParser.classify_actor(npc),
+        target_name=None, target_type=None,
+        verb=None, amount=None, outcome=None,
+        extra=extra,
+    )
+
+
+def h_npc_reward(m):
+    # "You receive 100 gold from Vilnius the Small." -- currency handed to
+    # you directly by an NPC (as opposed to h_currency's "from the corpse",
+    # or a vendor sell's "from X for the Y(s)."). UNCONFIRMED against a raw
+    # log capture -- derived from a third-party quest walkthrough's quoted
+    # log lines, not yet observed in a real eqlog_*.txt here. Revisit once
+    # a real example turns up (same "expected, not yet observed" status as
+    # h_resisted below).
+    npc = m.group("npc")
+    if " for the " in npc:
+        # "You receive 5 silver 3 copper from a clockwork jeweler for the
+        # Copper Band(s)." -- a vendor sell (see h_vendor_sell), not an
+        # NPC-granted reward. h_vendor_sell's pattern is tried first (see
+        # PATTERNS ordering), so this only exists as a belt-and-suspenders
+        # guard in case that ordering ever changes.
+        return None
+    return ParsedEvent(
+        ts=None, raw_line=None, event_type="reward",
+        source_name=npc, source_type=GameParser.classify_actor(npc),
+        target_name="You", target_type="you",
+        verb=None, amount=None, outcome=None,
+        extra={"text": m.group("amount_text")},
+    )
+
+
+# Confirmed real /con reaction phrases (a full-log scan of all 409 real
+# "(Lvl: N)" lines matches every one of these with zero leftovers). These
+# reflect faction/attitude, not mob difficulty -- the "-- <flavor text>"
+# that follows (e.g. "looks like quite a gamble", "would wipe the floor
+# with you") is a level-*comparison* between you and the mob, not data
+# about the mob itself, so it's deliberately not captured/stored.
+# Maps each confirmed real phrase to classic EQ's actual short faction-con
+# name (ally/kindly/amiably/indifferently/apprehensively/dubiously/
+# threateningly/scowls) -- `outcome` is VARCHAR(16), too short for the full
+# phrase (every one of these is over 16 chars), and a short code is more in
+# keeping with `outcome`'s use elsewhere as a categorical tag (hit/crit/
+# miss/dodge/...) rather than prose.
+_CON_REACTIONS = {
+    "scowls at you, ready to attack": "hostile",
+    "glares at you threateningly": "threatening",
+    "glowers at you dubiously": "dubious",
+    "looks your way apprehensively": "apprehensive",
+    "judges you amiably": "amiable",
+    "regards you as an ally": "ally",
+    "regards you indifferently": "indifferent",
+    "kindly considers you": "kindly",
+}
+_CON_REACTION_ALT = "|".join(re.escape(r) for r in _CON_REACTIONS)
+
+
+def h_con(m):
+    mob = m.group("mob")
+    return ParsedEvent(
+        ts=None, raw_line=None, event_type="con",
+        source_name=mob, source_type=GameParser.classify_actor(mob),
+        target_name="You", target_type="you",
+        verb=None, amount=int(m.group("level")),
+        outcome=_CON_REACTIONS.get(m.group("reaction"), m.group("reaction")),
+        extra={"rare": bool(m.group("rare"))},
+    )
+
+
+def h_vendor_buy(m):
+    # "You purchased 10 Oak Shaft from a clockwork miner for  11 platinum 3
+    # gold 1 silver." -- the real sold-item catalog (name/qty/price) for a
+    # vendor NPC, confirmed real (288/288 matched in a full-log scan).
+    return ParsedEvent(
+        ts=None, raw_line=None, event_type="vendor_buy",
+        source_name=m.group("npc"), source_type=GameParser.classify_actor(m.group("npc")),
+        target_name=m.group("item"), target_type="item",
+        verb=None, amount=int(m.group("qty")), outcome=None,
+        extra={"price_text": m.group("price")},
+    )
+
+
+def h_vendor_sell(m):
+    # "You receive 5 silver 3 copper from a clockwork jeweler for the
+    # Copper Band(s)." -- confirmed real (22/22 matched), including the
+    # bulk-sell "...for the contents of your bag." shape. Only used as a
+    # supplementary vendor-identity signal -- h_vendor_buy is the clean
+    # catalog, so item_text is kept raw (untrimmed "(s)" suffix and all)
+    # rather than normalized.
+    npc = m.group("npc")
+    return ParsedEvent(
+        ts=None, raw_line=None, event_type="vendor_sell",
+        source_name=npc, source_type=GameParser.classify_actor(npc),
+        target_name="You", target_type="you",
+        verb=None, amount=None, outcome=None,
+        extra={"price_text": m.group("price"), "item_text": m.group("item")},
+    )
+
+
 def h_loot(m):
     qty = int(m.group("qty")) if m.group("qty") else 1
     return ParsedEvent(
@@ -552,11 +705,58 @@ class EQLegendsParser(GameParser):
         # "a greater kobold is struck by a sudden force." -- generic no-amount spell effect
         (re.compile(r"^(?P<target>.+?) is struck by (?P<desc>.+?)\.$"), h_struck_by_generic),
 
+        # "Orc taskmaster - a rare creature - scowls at you, ready to attack
+        # -- what would you like your tombstone to say? (Lvl: 14)" -- /con.
+        # The flavor text before "(Lvl:" can end in ".", "?", or "!"
+        # (confirmed against all 409 real matches in a full-log scan).
+        (re.compile(
+            r"^(?P<mob>.+?)(?P<rare> - a rare creature -)? (?P<reaction>" + _CON_REACTION_ALT + r") -- "
+            r".+?[.?!] \(Lvl: (?P<level>\d+)\)$"
+        ), h_con),
+
         (re.compile(r"^You have entered (?P<zone>.+?)\.$"), h_zone_change),
 
         (re.compile(r"^You gain experience! \((?P<pct>[\d.]+)%\)$"), h_exp),
 
         (re.compile(r"^You receive (?P<text>.+) from the corpse\.$"), h_currency),
+
+        # "You purchased 10 Oak Shaft from a clockwork miner for  11 platinum
+        # 3 gold 1 silver." -- confirmed real (288/288 in a full-log scan).
+        (re.compile(
+            r"^You purchased (?P<qty>\d+) (?P<item>.+?) from (?P<npc>.+?) for\s+(?P<price>.+?)\.$"
+        ), h_vendor_buy),
+
+        # "You receive 5 silver 3 copper from a clockwork jeweler for the
+        # Copper Band(s)." / "...for the contents of your bag." -- confirmed
+        # real (22/22). Must come before h_npc_reward below, which would
+        # otherwise also match this shape.
+        (re.compile(
+            r"^You receive\s+(?P<price>.+?) from (?P<npc>.+?) for the (?P<item>.+?)\.$"
+        ), h_vendor_sell),
+
+        # "You receive 100 gold from Vilnius the Small." (excludes vendor
+        # sells via ordering above and h_npc_reward's own "for the" check --
+        # see h_npc_reward docstring).
+        (re.compile(r"^You receive (?P<amount_text>.+?) from (?P<npc>.+?)\.$"), h_npc_reward),
+
+        # "You say, 'Hail, Translocator Fithop'" / bare "You say, 'Hail'".
+        # Must come before the generic h_say pattern below.
+        (re.compile(r"^You say, 'Hail(?:, (?P<npc>.+?))?'$"), h_hail),
+
+        # "You say, 'exiled'" -- anything else said locally, e.g. echoing a
+        # quest dialogue's bracketed keyword back to an NPC.
+        (re.compile(r"^You say, '(?P<text>.+)'$"), h_say),
+
+        # "A grikbar shaman says, '<Bark!>  Grrrr!'" / "Petlord says, 'exiled'"
+        (re.compile(r"^(?P<npc>.+?) says, '(?P<text>.+)'$"), h_npc_dialogue),
+
+        # "Tranixx Darkpaw shouts, 'I, Tranixx Darkpaw, have embraced...!'"
+        (re.compile(r"^(?P<npc>.+?) shouts, '(?P<text>.+)'$"), h_npc_dialogue),
+
+        # "Kozyn Gigglephizz chortles with glee.  'Ho, ho, ho!  ...'" -- note
+        # the double space and period (not comma) before the quote, unlike
+        # says/shouts above.
+        (re.compile(r"^(?P<npc>.+?) chortles with glee\.\s+'(?P<text>.+)'$"), h_npc_dialogue),
 
         # "You looted a Malachite from a grikbar kobold's corpse ..."
         # "You looted 2 Zombie Skin from a tormented dead's corpse ..."

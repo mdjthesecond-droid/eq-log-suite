@@ -2,17 +2,20 @@
 {% block title %}Loot -- {{ game_label }}{% endblock %}
 {% block content %}
 <h1>Loot -- {{ game_label }}</h1>
-<p>Drop table reconstructed from your own kills, not a wiki guess. Organized zone -> npc -> item.
-chance% = how many of your kills of that NPC (in that zone) actually dropped this item -- not
-every kill drops something, so this is drops divided by kills, not just a count of drops. Over
-100% just means it can drop more than once per kill on average, not an error. avg qty is just an
-average (loot amounts aren't fixed tiers the way gathering yields are).</p>
+<p>Search-only: enter a zone/npc/item below to reconstruct a drop table from your own kills, not a
+wiki guess. Per-zone and per-npc loot are already covered on each zone's own
+<a href="/zoneinfo/{{ game }}">Zone Info</a> page and each NPC's own <a href="/npcs/{{ game }}">NPC</a>
+page, so this stays a search rather than rendering the whole drop table every time. chance% = how many
+of your kills of that NPC (in that zone) actually dropped this item -- not every kill drops something,
+so this is drops divided by kills, not just a count of drops. Over 100% just means it can drop more
+than once per kill on average, not an error. avg qty is just an average (loot amounts aren't fixed
+tiers the way gathering yields are).</p>
 
 <form method="get" action="/loot/{{ game }}">
   <input name="zone" placeholder="zone contains" value="{{ filters.zone }}">
   <input name="npc" placeholder="npc contains" value="{{ filters.npc }}">
   <input name="item" placeholder="item contains" value="{{ filters.item }}">
-  <button type="submit">Filter</button>
+  <button type="submit">Search</button>
 </form>
 
 {% if unresolved_zone_starts %}
@@ -32,36 +35,38 @@ average (loot amounts aren't fixed tiers the way gathering yields are).</p>
 </div>
 {% endif %}
 
-{% if not rows %}
-<p>No loot data yet{% if filters.zone or filters.npc or filters.item %} matching those filters{% endif %}.</p>
+{% if not searched %}
+<p>Enter a zone, npc, and/or item above and hit Search.</p>
+{% elif not rows %}
+<p>No loot data matching that search.</p>
 {% endif %}
 
-{% for zone, zone_items in rows|groupby('zone') %}
+{% for item, item_rows in rows|groupby('item') %}
 <details>
-  <summary>{{ zone }}</summary>
-  {% for npc, npc_items in zone_items|groupby('npc') %}
-  {% set first = npc_items[0] %}
-  <details class="nested">
-    <summary>{{ npc }}
-      <span style="font-weight:400; font-size:0.85rem; opacity:0.8;">-- {{ first.kill_count or 0 }} kills</span>
-    </summary>
-    <table class="sortable">
-      <thead>
-        <tr><th>item</th><th>avg qty</th><th>chance %</th><th>drops</th></tr>
-      </thead>
-      <tbody>
-        {% for r in npc_items %}
-        <tr>
-          <td>{{ r.item }}</td>
-          <td>{{ r.avg_qty }}</td>
-          <td>{{ r.chance_pct if r.chance_pct is not none else '?' }}%</td>
-          <td>{{ r.drops }}</td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </details>
-  {% endfor %}
+  <summary>{{ item }}</summary>
+  <table class="sortable">
+    <thead>
+      <tr><th>zone</th><th>npc</th><th>level</th><th>avg qty</th><th>chance %</th><th>drops</th></tr>
+    </thead>
+    <tbody>
+      {% for r in item_rows %}
+      <tr>
+        <td>
+          {% if r.zone == '(unknown zone)' %}{{ r.zone }}
+          {% else %}<a href="/zoneinfo/{{ game }}/detail?zone={{ r.zone|urlencode }}">{{ r.zone }}</a>{% endif %}
+        </td>
+        <td>
+          {% if r.npc == '(unknown npc)' %}{{ r.npc }}
+          {% else %}<a href="/npcs/{{ game }}/detail?npc={{ r.npc|urlencode }}">{{ r.npc }}</a>{% endif %}
+        </td>
+        <td>{{ r.level or '' }}</td>
+        <td>{{ r.avg_qty }}</td>
+        <td>{{ r.chance_pct if r.chance_pct is not none else '?' }}%</td>
+        <td>{{ r.drops }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
 </details>
 {% endfor %}
 {% endblock %}

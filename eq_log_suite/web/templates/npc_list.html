@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}NPCs -- {{ game_label }}{% endblock %}
+{% block content %}
+<h1>NPCs -- {{ game_label }}</h1>
+<p>Type is auto-suggested (vendor if a purchase/sale was ever seen, mob if the name is
+article-prefixed like "a grikbar kobold", npc otherwise) -- override it from the NPC's own page.</p>
+
+<form method="get" action="/npcs/{{ game }}">
+  <input name="search" placeholder="name contains" value="{{ search }}">
+  <button type="submit">Search</button>
+</form>
+
+{% if not rows %}
+<p>No NPCs found{% if search %} matching that search{% endif %}.</p>
+{% endif %}
+
+<div class="scroll-frame">
+<table class="sortable">
+  <thead>
+    <tr><th>npc</th><th>type</th><th>level range</th><th>rare</th><th>kills</th><th>dialogue lines</th><th>note</th></tr>
+  </thead>
+  <tbody>
+    {% for r in rows %}
+    <tr>
+      <td><a href="/npcs/{{ game }}/detail?npc={{ r.npc|urlencode }}">{{ r.npc }}</a></td>
+      <td>{{ r.npc_type }}</td>
+      <td>{% if r.level_min is not none %}{{ r.level_min }}-{{ r.level_max }}{% endif %}</td>
+      <td>{{ '★' if r.rare else '' }}</td>
+      <td>{{ r.kills or 0 }}</td>
+      <td>{{ r.dialogue_lines or 0 }}</td>
+      <td>{{ r.note or '' }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endblock %}

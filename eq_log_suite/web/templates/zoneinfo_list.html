@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}Zone Info -- {{ game_label }}{% endblock %}
+{% block content %}
+<h1>Zone Info -- {{ game_label }}</h1>
+<p>One row per zone (instance tiers/solo variants of the same zone are combined here -- see each
+zone's own page for a tier/solo toggle). Level range comes from <code>/con</code>ning mobs there
+(overridable per zone on its own page if you know better or nothing's been conned yet).</p>
+
+{% if not rows %}
+<p>No zone data yet.</p>
+{% endif %}
+
+<div class="scroll-frame">
+<table class="sortable">
+  <thead>
+    <tr><th>zone</th><th>level range</th><th>npcs seen</th><th>rare mobs</th><th>note</th></tr>
+  </thead>
+  <tbody>
+    {% for r in rows %}
+    <tr>
+      <td><a href="/zoneinfo/{{ game }}/detail?zone={{ r.zone|urlencode }}">{{ r.zone }}</a></td>
+      <td>
+        {% if r.level_min is not none or r.level_max is not none %}
+          {{ r.level_min if r.level_min is not none else '?' }}-{{ r.level_max if r.level_max is not none else '?' }}
+        {% else %}
+          <span style="opacity:0.6;">no con data yet</span>
+        {% endif %}
+      </td>
+      <td>{{ r.npc_count }}</td>
+      <td>{{ r.rare_count }}</td>
+      <td>{{ r.note or '' }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endblock %}

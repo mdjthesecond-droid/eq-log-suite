@@ -107,6 +107,30 @@ CREATE TABLE IF NOT EXISTS node_tiers (
     identified_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB;
 
+-- User-curated NPC type (log text can strongly suggest "vendor" via
+-- vendor_buy/vendor_sell events, or "mob" via classify_actor's
+-- article-prefix heuristic, but can't say "class trainer" or otherwise
+-- distinguish a unique-named NPC from a unique-named mob) -- /npcs shows
+-- an auto-suggested type alongside this override, same UX as node_tiers.
+CREATE TABLE IF NOT EXISTS npc_info (
+    npc VARCHAR(255) NOT NULL PRIMARY KEY,
+    npc_type VARCHAR(32) NULL,
+    note VARCHAR(255) NULL,
+    confirmed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB;
+
+-- User-curated zone level-range override, keyed by base_zone (see
+-- parse_zone_tier() in eq_legends.py) -- fills in/corrects the level range
+-- /zoneinfo otherwise derives from `con` events, for zones with no con data
+-- yet or where the user wants to override the observed range.
+CREATE TABLE IF NOT EXISTS zone_info (
+    zone VARCHAR(255) NOT NULL PRIMARY KEY,
+    level_min_override INT NULL,
+    level_max_override INT NULL,
+    note VARCHAR(255) NULL,
+    confirmed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB;
+
 -- Zone correlation (used by /loot, /gathering, /quests) works by finding the
 -- most recent zone_change logged before an event's own ts -- but a
 -- character's very first bit of activity, before their first zone_change
