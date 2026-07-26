@@ -13,6 +13,28 @@
   {% for z in zones %}<a href="/zoneinfo/{{ game }}/detail?zone={{ z|urlencode }}">{{ z }}</a>{% if not loop.last %}, {% endif %}{% else %}none yet{% endfor %}
 </p>
 
+{% if combat_tiers %}
+<h2>Combat</h2>
+<p style="opacity:0.7;">Estimated HP from your own damage between the previous kill (or zone
+entry) and each death -- not exact: pet/other-player damage isn't counted (so a group kill
+undercounts), and two same-named mobs up at once conflate into one window, which is why min/max
+can spread wide for common trash names. Level range is from <code>con</code>{% if game == 'eq2' %}
+(not yet captured for EQ2){% endif %}.</p>
+<table class="sortable">
+  <thead><tr><th>tier</th><th>level range</th><th>kills</th><th>est. HP (min / avg / max)</th></tr></thead>
+  <tbody>
+    {% for t in combat_tiers %}
+    <tr>
+      <td>{{ 'Base' if not t.tier or t.tier == '0' else (t.tier_label or 'Tier') ~ ' ' ~ t.tier }}</td>
+      <td>{% if t.level_min is not none %}{{ t.level_min }}{% if t.level_max != t.level_min %}-{{ t.level_max }}{% endif %}{% else %}--{% endif %}</td>
+      <td>{{ t.kills }}</td>
+      <td>{% if t.hp_min is not none %}{{ t.hp_min }} / {{ t.hp_avg }} / {{ t.hp_max }}{% else %}--{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
 <details style="margin-bottom:1rem;">
   <summary>Type override / note</summary>
   <form method="post" action="/npc-info/set" style="display:flex; gap:0.5rem; align-items:center;">

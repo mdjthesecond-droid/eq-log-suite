@@ -1,3 +1,4 @@
+import bisect
 import json
 import os
 import re
@@ -559,7 +560,11 @@ def _compute_dialogue(game, character="", npc="", zone="", exclude_chatter=False
     try:
         with conn.cursor() as cur:
             cur.execute(sql, (inner_params * len(branches)) + outer_params)
-            rows = cur.fetchall()
+            # pymysql's fetchall() returns () for zero rows but a list for
+            # one-or-more -- list() here so the `rows + reward_extras` below
+            # doesn't blow up on any NPC with no dialogue lines at all (i.e.
+            # most plain combat mobs).
+            rows = list(cur.fetchall())
 
             # The reward for a trade isn't always the currency-from-npc
             # `reward` event -- confirmed real: the one trade in the log
@@ -877,6 +882,28 @@ def _compute_zones(game, character="", zone="", start_ts="", end_ts=""):
                     list(char_ids),
                 )
                 last_activity = {r["character_id"]: r["last_ts"] for r in cur.fetchall()}
+
+            # Per-NPC-name kill counts for each session, to validate how many
+            # of each mob were actually involved (e.g. after merging "A
+            # jeering gargoyle"/"a jeering gargoyle" into one name) rather
+            # than just the single combined `kills` total above. Bulk-fetched
+            # and bucketed in Python via bisect -- same reasoning as
+            # _compute_npc_combat_tiers's docstring: a correlated per-session
+            # subquery here would be the same slow anti-pattern.
+            all_char_ids = sorted({r["character_id"] for r in rows})
+            deaths_by_char = {}
+            if all_char_ids:
+                fmt = ",".join(["%s"] * len(all_char_ids))
+                cur.execute(
+                    f"SELECT character_id, ts, target_name FROM events "
+                    f"WHERE character_id IN ({fmt}) AND event_type='death' AND target_type != 'you' "
+                    "ORDER BY character_id, ts",
+                    all_char_ids,
+                )
+                for d in cur.fetchall():
+                    deaths_by_char.setdefault(d["character_id"], {"ts": [], "name": []})
+                    deaths_by_char[d["character_id"]]["ts"].append(d["ts"])
+                    deaths_by_char[d["character_id"]]["name"].append(d["target_name"])
     finally:
         conn.close()
 
@@ -900,6 +927,14 @@ def _compute_zones(game, character="", zone="", start_ts="", end_ts=""):
             r["dps"] = None
         r["hit_pct"] = round(r["landed"] / r["swings"] * 100, 1) if r["swings"] else None
         r["crit_pct"] = round(r["crits"] / r["landed"] * 100, 1) if r["landed"] else None
+
+        d = deaths_by_char.get(r["character_id"], {"ts": [], "name": []})
+        lo = bisect.bisect_left(d["ts"], r["entered_at"])
+        hi = bisect.bisect_right(d["ts"], r["left_at"]) if r["left_at"] else len(d["ts"])
+        counts = {}
+        for name in d["name"][lo:hi]:
+            counts[name] = counts.get(name, 0) + 1
+        r["npc_kills"] = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
 
     return rows
 
@@ -1423,6 +1458,150 @@ def _compute_npc_list(game, search="", zone=""):
     return rows
 
 
+def _compute_npc_combat_tiers(game, name):
+    # Estimated HP per zone tier, from your own damage between the previous
+    # kill (or zone entry) and each death -- there's no per-mob-instance ID
+    # in the log, so this is an estimate, not exact HP: only source_type='you'
+    # damage counts (pet/other-player hits don't), so a group kill undercounts,
+    # and two simultaneously-up mobs sharing the same name (see tailer.py's
+    # CombatTracker docstring for the same limitation) conflate into one
+    # window, which is why min/max can spread wide for common trash names.
+    # Level range per tier comes from `con` the same way (EQ2 has no `con`
+    # parsing yet, so those rows are always level_min/max=None).
+    #
+    # Computed by bulk-fetching each character's death/zone_change/damage
+    # rows and doing the windowing here via bisect, rather than correlating
+    # tier/kill-window with per-row scalar subqueries in SQL -- the SQL
+    # version of this (nesting a kill-window scalar subquery inside a
+    # per-death correlated subquery) took over two minutes on a busy NPC;
+    # this is under 0.1s even for a 200-kill NPC. Same lesson as
+    # _compute_zone_list's docstring, applied to a per-character-timeline
+    # correlation instead of a per-zone one.
+    conn = db.get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT d.character_id, d.ts AS death_ts "
+                "FROM events d JOIN games g ON d.game_id=g.id "
+                "WHERE g.code=%s AND d.event_type='death' AND d.target_name=%s "
+                "  AND d.source_type='you' AND d.target_type != 'you' "
+                "ORDER BY d.character_id, d.ts",
+                (game, name),
+            )
+            deaths = cur.fetchall()
+
+            cur.execute(
+                "SELECT ev.character_id, ev.ts, ev.amount AS level "
+                "FROM events ev JOIN games g ON ev.game_id=g.id "
+                "WHERE g.code=%s AND ev.event_type='con' AND ev.source_name=%s",
+                (game, name),
+            )
+            cons = cur.fetchall()
+
+            char_ids = sorted({r["character_id"] for r in deaths} | {r["character_id"] for r in cons})
+            zone_changes, damage = [], []
+            if char_ids:
+                fmt = ",".join(["%s"] * len(char_ids))
+                cur.execute(
+                    f"SELECT character_id, ts, JSON_EXTRACT(extra,'$.tier') AS tier, "
+                    "JSON_UNQUOTE(JSON_EXTRACT(extra,'$.tier_label')) AS tier_label "
+                    f"FROM events WHERE event_type='zone_change' AND character_id IN ({fmt}) ORDER BY character_id, ts",
+                    char_ids,
+                )
+                zone_changes = cur.fetchall()
+
+                cur.execute(
+                    "SELECT character_id, ts, amount FROM events "
+                    "WHERE event_type IN ('melee','spell_damage','ability_damage') AND source_type='you' "
+                    f"AND target_name=%s AND character_id IN ({fmt}) AND amount IS NOT NULL ORDER BY character_id, ts",
+                    [name] + char_ids,
+                )
+                damage = cur.fetchall()
+    finally:
+        conn.close()
+
+    if not deaths and not cons:
+        return []
+
+    zc_by_char = {}
+    for r in zone_changes:
+        zc = zc_by_char.setdefault(r["character_id"], {"ts": [], "rows": []})
+        zc["ts"].append(r["ts"])
+        zc["rows"].append(r)
+
+    def tier_at(char_id, ts):
+        zc = zc_by_char.get(char_id)
+        if not zc:
+            return None, None
+        i = bisect.bisect_right(zc["ts"], ts) - 1
+        return (zc["rows"][i]["tier"], zc["rows"][i]["tier_label"]) if i >= 0 else (None, None)
+
+    dmg_by_char = {}
+    for r in damage:
+        dmg = dmg_by_char.setdefault(r["character_id"], {"ts": [], "amt": []})
+        dmg["ts"].append(r["ts"])
+        dmg["amt"].append(r["amount"])
+
+    deaths_by_char = {}
+    for r in deaths:
+        deaths_by_char.setdefault(r["character_id"], []).append(r["death_ts"])
+
+    by_tier = {}
+
+    def bucket(tier):
+        return by_tier.setdefault(tier, {"tier_label": None, "kills": 0, "hp_totals": [], "levels": []})
+
+    for char_id, char_deaths in deaths_by_char.items():
+        zc = zc_by_char.get(char_id, {"ts": [], "rows": []})
+        dmg = dmg_by_char.get(char_id, {"ts": [], "amt": []})
+
+        for i, death_ts in enumerate(char_deaths):
+            tier, tier_label = tier_at(char_id, death_ts)
+
+            # Window start: the later of this character's previous kill of
+            # this same NPC name, or their most recent zone entry -- whichever
+            # bounds the fight more tightly, so an unrelated earlier kill
+            # (or a stale window reaching across a zone change) doesn't get
+            # summed in.
+            window_start = char_deaths[i - 1] if i > 0 else None
+            zi = bisect.bisect_right(zc["ts"], death_ts) - 1
+            if zi >= 0 and (window_start is None or zc["ts"][zi] > window_start):
+                window_start = zc["ts"][zi]
+
+            lo = bisect.bisect_right(dmg["ts"], window_start) if window_start else 0
+            hi = bisect.bisect_right(dmg["ts"], death_ts)
+            kill_total = sum(dmg["amt"][lo:hi])
+            if kill_total:
+                b = bucket(tier)
+                b["kills"] += 1
+                b["hp_totals"].append(kill_total)
+                if tier_label:
+                    b["tier_label"] = tier_label
+
+    for r in cons:
+        tier, tier_label = tier_at(r["character_id"], r["ts"])
+        b = bucket(tier)
+        b["levels"].append(r["level"])
+        if tier_label:
+            b["tier_label"] = tier_label
+
+    out = []
+    for tier, b in by_tier.items():
+        row = {
+            "tier": tier, "tier_label": b["tier_label"], "kills": b["kills"],
+            "level_min": min(b["levels"]) if b["levels"] else None,
+            "level_max": max(b["levels"]) if b["levels"] else None,
+        }
+        if b["hp_totals"]:
+            row["hp_min"] = min(b["hp_totals"])
+            row["hp_avg"] = round(sum(b["hp_totals"]) / len(b["hp_totals"]))
+            row["hp_max"] = max(b["hp_totals"])
+        else:
+            row["hp_min"] = row["hp_avg"] = row["hp_max"] = None
+        out.append(row)
+    return sorted(out, key=lambda r: (r["tier"] is None, r["tier"]))
+
+
 def _compute_npc_detail(game, name, tier="all"):
     tier_expr, _ = _tier_solo_exprs()
     conn = db.get_connection()
@@ -1517,6 +1696,7 @@ def _compute_npc_detail(game, name, tier="all"):
         "level_min": con_stats["level_min"],
         "level_max": con_stats["level_max"],
         "rare": bool(con_stats["rare"]),
+        "combat_tiers": _compute_npc_combat_tiers(game, name),
         "vendor": is_vendor,
         "catalog": catalog,
         "loot": loot,

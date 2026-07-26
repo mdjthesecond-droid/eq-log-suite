@@ -74,3 +74,25 @@ class GameParser:
         if re.match(r"^(a|an|the)\s", stripped, re.IGNORECASE):
             return "npc"
         return "unknown"
+
+
+# The client capitalizes whatever word starts a log line's sentence -- for a
+# generic trash mob that means "A jeering gargoyle hits YOU..." (mob dealing
+# damage, capitalized) vs "You hit a jeering gargoyle..." (mob taking damage,
+# lowercase mid-sentence). Same mob either way; normalize the leading article
+# back to lowercase so every downstream query groups them as one NPC instead
+# of two. No lowercase-next-letter requirement -- confirmed against real data
+# that this also applies to names with a capitalized second word (e.g. "A
+# Foul Wind" / "a Foul Wind", "A Teir`Dal priest" / "a Teir`Dal priest"), only
+# the leading article's own case ever changes. Deliberately narrow (only a
+# bare "A "/"An " prefix, not "The " -- that one's more likely a genuine
+# proper-noun unique name) and confirmed empirically: every capitalized-
+# article name in the existing dataset already had an exact lowercase twin,
+# none were capitalized-only.
+_LEADING_ARTICLE_RE = re.compile(r"^(A|An) ")
+
+
+def normalize_actor_name(name: Optional[str]) -> Optional[str]:
+    if not name:
+        return name
+    return _LEADING_ARTICLE_RE.sub(lambda m: m.group(1).lower() + " ", name)

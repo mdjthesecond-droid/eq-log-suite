@@ -3,6 +3,8 @@ so historical import and live catch-up never diverge in behavior."""
 
 import json
 
+from eq_log_suite.parsers.base import normalize_actor_name
+
 
 class RareGatherTagger:
     """Correlates EQ2's 'You have found a rare item!' marker line with the
@@ -43,6 +45,20 @@ def insert_batch(conn, game_id, character_id, log_source_id, events_batch, raw_b
     with conn.cursor() as cur:
         event_id_by_idx = {}
         for idx, event in events_batch:
+            # Same mob logs as "A jeering gargoyle" (sentence-initial, e.g.
+            # dealing damage to you) or "a jeering gargoyle" (mid-sentence,
+            # e.g. you dealing damage to it) -- normalize so both group as
+            # one NPC everywhere downstream. Gated on type in ('npc',
+            # 'unknown') -- both are actor-name slots (never items/zones),
+            # 'unknown' included because a few handlers (e.g. eq_legends.py's
+            # h_slain_by, for "X has been slain by Y") hardcode it without
+            # running classify_actor at all; normalize_actor_name's own
+            # regex (only a literal "A "/"An " prefix) is the real safety
+            # net here, not this type check.
+            if event.source_type in ("npc", "unknown"):
+                event.source_name = normalize_actor_name(event.source_name)
+            if event.target_type in ("npc", "unknown"):
+                event.target_name = normalize_actor_name(event.target_name)
             cur.execute(
                 "INSERT INTO events (game_id, character_id, log_source_id, ts, event_type, "
                 "source_name, source_type, target_name, target_type, verb, amount, outcome, "
