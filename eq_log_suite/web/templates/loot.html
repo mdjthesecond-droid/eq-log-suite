@@ -35,10 +35,10 @@ tiers the way gathering yields are).</p>
 </div>
 {% endif %}
 
-{% if not searched %}
-<p>Enter a zone, npc, and/or item above and hit Search.</p>
-{% elif not rows %}
+{% if not rows %}
 <p>No loot data matching that search.</p>
+{% elif truncated %}
+<p style="opacity:0.8;">List truncated, please refine.</p>
 {% endif %}
 
 {% for item, item_rows in rows|groupby('item') %}

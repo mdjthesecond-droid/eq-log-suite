@@ -312,6 +312,9 @@ def gathering_new_era(name: str = Form(...), note: str = Form(""), game: str = F
     return RedirectResponse(f"/gathering/{game}", status_code=303)
 
 
+LOOT_RESULT_LIMIT = 50
+
+
 def _compute_loot(game, npc="", item="", zone=""):
     # /loot used to render the *entire* zone->npc->item drop table
     # unconditionally (~0.7s of correlated zone lookups over every loot/
@@ -341,8 +344,14 @@ def _compute_loot(game, npc="", item="", zone=""):
     zone_where = ""
     zone_params = []
     if zone:
-        zone_where = "WHERE zone LIKE %s"
-        zone_params = [f"%{zone}%"]
+        # zone comes from _base_zone_expr(), a JSON_UNQUOTE(JSON_EXTRACT(...))
+        # expression -- MariaDB gives those utf8mb4_bin collation (binary,
+        # case-sensitive) regardless of the source column's own collation,
+        # unlike npc/item above which stay on source_name/target_name's
+        # native case-insensitive collation. LOWER() on both sides restores
+        # the same case-insensitive matching as every other search field.
+        zone_where = "WHERE LOWER(zone) LIKE %s"
+        zone_params = [f"%{zone.lower()}%"]
 
     sql = (
         # Drop chance needs kills as the denominator -- not every kill drops
@@ -379,14 +388,21 @@ def _compute_loot(game, npc="", item="", zone=""):
         "  ROUND(lg.drops / k.kill_count * 100, 2) AS chance_pct "
         "  FROM loot_grouped lg LEFT JOIN kills k ON k.npc = lg.npc AND k.zone <=> lg.zone"
         ") t "
-        f"{zone_where} ORDER BY item, chance_pct DESC"
+        f"{zone_where} ORDER BY item, chance_pct DESC "
+        "LIMIT %s"
     )
 
     conn = db.get_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute(sql, loot_params + [game] + zone_params)
+            # Fetch one row past the limit just to detect truncation, then
+            # trim it back off below -- lets a wide-open, no-filter search
+            # (npc/item/zone all blank) stay cheap instead of materializing
+            # every loot row in the game.
+            cur.execute(sql, loot_params + [game] + zone_params + [LOOT_RESULT_LIMIT + 1])
             rows = cur.fetchall()
+            truncated = len(rows) > LOOT_RESULT_LIMIT
+            rows = rows[:LOOT_RESULT_LIMIT]
 
             # Level (from /con) as appropriate, per npc -- same source as
             # each NPC's own page, just fetched once here rather than
@@ -422,32 +438,32 @@ def _compute_loot(game, npc="", item="", zone=""):
                 str(lvl["level_min"]) if lvl["level_min"] == lvl["level_max"]
                 else f'{lvl["level_min"]}-{lvl["level_max"]}'
             )
-    return rows
+    return rows, truncated
 
 
 @app.get("/loot/eql", response_class=HTMLResponse)
 def loot_report_eql(request: Request, npc: str = "", item: str = "", zone: str = ""):
-    rows = _compute_loot("eql", npc, item, zone) if (npc or item or zone) else []
+    rows, truncated = _compute_loot("eql", npc, item, zone)
     return templates.TemplateResponse(request, "loot.html", {
         "rows": rows,
+        "truncated": truncated,
         "game": "eql",
         "game_label": "EQ Legends",
         "unresolved_zone_starts": _unresolved_zone_starts("eql"),
         "filters": {"npc": npc, "item": item, "zone": zone},
-        "searched": bool(npc or item or zone),
     })
 
 
 @app.get("/loot/eq2", response_class=HTMLResponse)
 def loot_report_eq2(request: Request, npc: str = "", item: str = "", zone: str = ""):
-    rows = _compute_loot("eq2", npc, item, zone) if (npc or item or zone) else []
+    rows, truncated = _compute_loot("eq2", npc, item, zone)
     return templates.TemplateResponse(request, "loot.html", {
         "rows": rows,
         "game": "eq2",
         "game_label": "EverQuest II",
+        "truncated": truncated,
         "unresolved_zone_starts": _unresolved_zone_starts("eq2"),
         "filters": {"npc": npc, "item": item, "zone": zone},
-        "searched": bool(npc or item or zone),
     })
 
 
