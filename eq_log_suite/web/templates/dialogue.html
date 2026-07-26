@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% block title %}Quests -- {{ game_label }}{% endblock %}
+{% macro npclink(name) %}{% if name %}<a href="/npcs/{{ game }}/detail?npc={{ name|urlencode }}">{{ name }}</a>{% endif %}{% endmacro %}
 {% block content %}
 <h1>Quests -- {{ game_label }}</h1>
 <p>Classic EQ almost never logs a "quest completed" or "give item to NPC" line -- only NPC dialogue,
@@ -12,7 +13,8 @@ chatter (no bracketed keyword, no item exchange) is hidden here -- it's not lost
 NPC's own page, so this stays focused on what's actually quest-relevant. zone is whatever zone_change
 happened most recently before the line; npc is who you hailed (for a hail line) or who's speaking/
 receiving (for dialogue/reward/offer lines) -- blank for a plain "you say" line, since text alone
-can't tell who you were talking to.</p>
+can't tell who you were talking to. Shows only the most recent {{ limit }} lines matching the
+filters below -- for anything deeper, search by character/npc/zone, or visit that NPC's own page.</p>
 
 <form method="get" action="/quests/{{ game }}">
   <input name="character" placeholder="character" value="{{ filters.character }}">
@@ -40,6 +42,8 @@ can't tell who you were talking to.</p>
 
 {% if not rows %}
 <p>No dialogue captured yet{% if filters.character or filters.npc or filters.zone %} matching those filters{% endif %}.</p>
+{% elif truncated %}
+<p style="opacity:0.7;">Showing the most recent {{ limit }} matching lines -- narrow the filters above for older ones.</p>
 {% endif %}
 
 <div class="scroll-frame">
@@ -53,21 +57,21 @@ can't tell who you were talking to.</p>
       <td>{{ r.ts }}</td>
       <td>{{ r.character_name }}</td>
       <td>{{ r.zone or '' }}</td>
-      <td>{{ r.npc or '' }}</td>
+      <td>{{ npclink(r.npc) }}</td>
       <td>
         <span class="dlg-{{ r.kind }}">
         {%- if r.kind == 'hail' -%}
-          &rarr; Hail{% if r.npc %}, {{ r.npc }}{% endif %}
+          &rarr; Hail{% if r.npc %}, {{ npclink(r.npc) }}{% endif %}
         {%- elif r.kind == 'say' -%}
           You say, '{{ r.text }}'
         {%- elif r.kind == 'npc_dialogue' -%}
-          <strong>{{ r.npc }}</strong> says, '{{ r.text }}'
+          <strong>{{ npclink(r.npc) }}</strong> says, '{{ r.text }}'
         {%- elif r.kind == 'reward' -%}
-          &#10003; received {% if r.loot_link %}<a href="{{ r.loot_link }}">{{ r.text }}</a>{% else %}{{ r.text }}{% endif %} from {{ r.npc }}
+          &#10003; received {% if r.loot_link %}<a href="{{ r.loot_link }}">{{ r.text }}</a>{% else %}{{ r.text }}{% endif %} from {{ npclink(r.npc) }}
         {%- elif r.kind == 'item_offer' -%}
-          &rarr; offered {{ r.amount }} {{ r.text }} to {{ r.npc }}
+          &rarr; offered {{ r.amount }} {{ r.text }} to {{ npclink(r.npc) }}
         {%- elif r.kind == 'trade_complete' -%}
-          &#10003; completed trade with {{ r.npc }}
+          &#10003; completed trade with {{ npclink(r.npc) }}
         {%- elif r.kind in ('exp', 'faction') -%}
           &#10003; reward: {{ r.text }}
         {%- endif -%}

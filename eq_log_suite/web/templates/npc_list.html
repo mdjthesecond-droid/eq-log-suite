@@ -2,28 +2,33 @@
 {% block title %}NPCs -- {{ game_label }}{% endblock %}
 {% block content %}
 <h1>NPCs -- {{ game_label }}</h1>
-<p>Type is auto-suggested (vendor if a purchase/sale was ever seen, mob if the name is
-article-prefixed like "a grikbar kobold", npc otherwise) -- override it from the NPC's own page.</p>
+<p>Search-only, same reason as /loot: type is auto-suggested (vendor if a purchase/sale was ever
+seen, mob if the name is article-prefixed like "a grikbar kobold", npc otherwise) -- override it
+from the NPC's own page.</p>
 
 <form method="get" action="/npcs/{{ game }}">
   <input name="search" placeholder="name contains" value="{{ search }}">
+  <input name="zone" placeholder="zone contains" value="{{ zone }}">
   <button type="submit">Search</button>
 </form>
 
-{% if not rows %}
-<p>No NPCs found{% if search %} matching that search{% endif %}.</p>
+{% if not searched %}
+<p>Enter a name and/or zone above and hit Search.</p>
+{% elif not rows %}
+<p>No NPCs found matching that search.</p>
 {% endif %}
 
 <div class="scroll-frame">
 <table class="sortable">
   <thead>
-    <tr><th>npc</th><th>type</th><th>level range</th><th>rare</th><th>kills</th><th>dialogue lines</th><th>note</th></tr>
+    <tr><th>npc</th><th>type</th><th>zone</th><th>level range</th><th>rare</th><th>kills</th><th>dialogue lines</th><th>note</th></tr>
   </thead>
   <tbody>
     {% for r in rows %}
     <tr>
       <td><a href="/npcs/{{ game }}/detail?npc={{ r.npc|urlencode }}">{{ r.npc }}</a></td>
       <td>{{ r.npc_type }}</td>
+      <td>{{ r.zones or '' }}</td>
       <td>{% if r.level_min is not none %}{{ r.level_min }}-{{ r.level_max }}{% endif %}</td>
       <td>{{ '★' if r.rare else '' }}</td>
       <td>{{ r.kills or 0 }}</td>

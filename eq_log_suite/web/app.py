@@ -277,16 +277,6 @@ def _compute_gathering(game, character="", zone="", node="", item="", skill="", 
     }
 
 
-@app.get("/gathering/eql", response_class=HTMLResponse)
-def gathering_report_eql(
-    request: Request, character: str = "", zone: str = "", node: str = "",
-    item: str = "", skill: str = "", era: str = "current",
-):
-    ctx = _compute_gathering("eql", character, zone, node, item, skill, era)
-    ctx.update({"game": "eql", "game_label": "EQ Legends", "unresolved_zone_starts": _unresolved_zone_starts("eql")})
-    return templates.TemplateResponse(request, "gathering.html", ctx)
-
-
 @app.get("/gathering/eq2", response_class=HTMLResponse)
 def gathering_report_eq2(
     request: Request, character: str = "", zone: str = "", node: str = "",
@@ -298,7 +288,7 @@ def gathering_report_eq2(
 
 
 @app.post("/gathering/set-tier")
-def gathering_set_tier(node: str = Form(...), tier: str = Form(...), note: str = Form(""), game: str = Form("eql")):
+def gathering_set_tier(node: str = Form(...), tier: str = Form(...), note: str = Form(""), game: str = Form("eq2")):
     conn = db.get_connection()
     try:
         with conn.cursor() as cur:
@@ -314,7 +304,7 @@ def gathering_set_tier(node: str = Form(...), tier: str = Form(...), note: str =
 
 
 @app.post("/gathering/new-era")
-def gathering_new_era(name: str = Form(...), note: str = Form(""), game: str = Form("eql")):
+def gathering_new_era(name: str = Form(...), note: str = Form(""), game: str = Form("eq2")):
     from eq_log_suite.gather_eras import new_era
 
     new_era(name, note or None, at=None)
@@ -673,13 +663,21 @@ def _compute_dialogue(game, character="", npc="", zone="", exclude_chatter=False
     return rows
 
 
+QUESTS_RECENT_LIMIT = 20  # anything deeper than this is what npc/character/zone
+# search is for -- keeps this page a quick recent-activity glance rather than
+# an ever-growing full history.
+
+
 @app.get("/quests/eql", response_class=HTMLResponse)
 def quests_report_eql(request: Request, character: str = "", npc: str = "", zone: str = ""):
     rows = _compute_dialogue("eql", character, npc, zone, exclude_chatter=True)
+    truncated = len(rows) > QUESTS_RECENT_LIMIT
+    rows = sorted(rows, key=lambda r: r["ts"])[-QUESTS_RECENT_LIMIT:]
     return templates.TemplateResponse(request, "dialogue.html", {
         "rows": rows, "game": "eql", "game_label": "EQ Legends",
         "unresolved_zone_starts": _unresolved_zone_starts("eql"),
         "filters": {"character": character, "npc": npc, "zone": zone},
+        "truncated": truncated, "limit": QUESTS_RECENT_LIMIT,
     })
 
 
@@ -797,16 +795,39 @@ def attacks_breakdown_eq2(request: Request, character: str = "", start_ts: str =
     return _render_attacks(request, "eq2", "EverQuest II", character, start_ts, end_ts)
 
 
-def _compute_zones(game, character=""):
+def _compute_zones(game, character="", zone="", start_ts="", end_ts=""):
+    # This is the expensive one: the LEFT JOIN below re-scans events across
+    # every zone-visit session's full time window to compute combat stats --
+    # fine for a handful of sessions, slow across a character's entire
+    # history (this is what was taking a while to load with no filters at
+    # all). So, same as /loot and /npcs, this only ever runs against
+    # whatever character/zone/date-range the user actually asks for -- see
+    # the routes below, which don't call this at all with no filters given.
     char_clauses, char_params = ["g.code = %s"], [game]
     if character:
         char_clauses.append("c.name = %s"); char_params.append(character)
-    char_where = f"AND {' AND '.join(char_clauses)}" if char_clauses else ""
+    char_where = f"AND {' AND '.join(char_clauses)}"
+
+    # zone/date filters narrow which *resulting sessions* get shown, not
+    # which raw zone_change rows compute the LEAD() boundary above -- doing
+    # it the other way (filtering the zone_change events themselves to just
+    # the searched zone/date) would silently corrupt left_at/duration for
+    # every session that isn't the character's very last one, by skipping
+    # over the real intervening zone changes the LEAD() needs to see.
+    outer_clauses, outer_params = [], []
+    if zone:
+        outer_clauses.append("zs.zone LIKE %s"); outer_params.append(f"%{zone}%")
+    if start_ts:
+        outer_clauses.append("zs.entered_at >= %s"); outer_params.append(start_ts)
+    if end_ts:
+        outer_clauses.append("zs.entered_at <= %s"); outer_params.append(end_ts)
+    outer_where = f"AND {' AND '.join(outer_clauses)}" if outer_clauses else ""
 
     # Zone "sessions" are the gap between one zone_change and the character's
     # next one; combat stats for that session are whatever damage/kill/melee
-    # events from you fall inside that time window. A NULL left_at means
-    # you're still in that zone (the most recent zone_change with nothing after it).
+    # events from you fall inside that time window. A NULL left_at means no
+    # further zone_change was ever recorded (see the logout/file-close
+    # fallback below).
     sql = (
         "WITH zone_sessions AS ("
         "  SELECT e.character_id, e.target_name AS zone, e.ts AS entered_at, "
@@ -814,7 +835,7 @@ def _compute_zones(game, character=""):
         "  FROM events e JOIN games g ON e.game_id=g.id JOIN characters c ON e.character_id=c.id "
         f"  WHERE e.event_type = 'zone_change' {char_where}"
         ") "
-        "SELECT c.name AS character_name, g.code AS game, zs.zone, zs.entered_at, zs.left_at, "
+        "SELECT zs.character_id, c.name AS character_name, g.code AS game, zs.zone, zs.entered_at, zs.left_at, "
         "  MIN(CASE WHEN e.event_type IN ('melee','spell_damage','ability_damage') AND e.source_type='you' THEN e.ts END) AS first_fight_at, "
         "  MAX(CASE WHEN e.event_type IN ('melee','spell_damage','ability_damage') AND e.source_type='you' THEN e.ts END) AS last_fight_at, "
         "  SUM(CASE WHEN e.event_type IN ('melee','spell_damage','ability_damage') AND e.source_type='you' THEN e.amount ELSE 0 END) AS total_damage, "
@@ -829,6 +850,7 @@ def _compute_zones(game, character=""):
         "JOIN games g ON g.id = c.game_id "
         "LEFT JOIN events e ON e.character_id = zs.character_id AND e.ts >= zs.entered_at "
         "  AND (zs.left_at IS NULL OR e.ts < zs.left_at) "
+        f"WHERE 1=1 {outer_where} "
         "GROUP BY zs.character_id, zs.zone, zs.entered_at, zs.left_at "
         "ORDER BY zs.entered_at DESC"
     )
@@ -836,18 +858,41 @@ def _compute_zones(game, character=""):
     conn = db.get_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute(sql, char_params)
+            cur.execute(sql, char_params + outer_params)
             rows = cur.fetchall()
+
+            # A NULL left_at doesn't necessarily mean "still in that zone" --
+            # it could just as well be the log ending (logout, crash, /log
+            # off) with no further zone_change ever recorded. There's no
+            # explicit logout line to key off of, so the character's last
+            # recorded event of any kind is the best available stand-in for
+            # "when the log stopped" -- only fetched for characters that
+            # actually have an open (NULL left_at) session, not everyone.
+            char_ids = {r["character_id"] for r in rows if r["left_at"] is None}
+            last_activity = {}
+            if char_ids:
+                fmt = ",".join(["%s"] * len(char_ids))
+                cur.execute(
+                    f"SELECT character_id, MAX(ts) AS last_ts FROM events WHERE character_id IN ({fmt}) GROUP BY character_id",
+                    list(char_ids),
+                )
+                last_activity = {r["character_id"]: r["last_ts"] for r in cur.fetchall()}
     finally:
         conn.close()
 
     for r in rows:
         total_damage = float(r["total_damage"] or 0)
         r["total_damage"] = total_damage
+        r["left_at_estimated"] = False
+        if r["left_at"] is None:
+            fallback = last_activity.get(r["character_id"])
+            if fallback and fallback > r["entered_at"]:
+                r["left_at"] = fallback
+                r["left_at_estimated"] = True
         if r["entered_at"] and r["left_at"]:
-            r["duration_s"] = round((r["left_at"] - r["entered_at"]).total_seconds())
+            r["duration_min"] = round((r["left_at"] - r["entered_at"]).total_seconds() / 60, 1)
         else:
-            r["duration_s"] = None
+            r["duration_min"] = None
         if r["first_fight_at"] and r["last_fight_at"]:
             span = (r["last_fight_at"] - r["first_fight_at"]).total_seconds()
             r["dps"] = round(total_damage / span, 1) if span > 0 else total_damage
@@ -860,20 +905,24 @@ def _compute_zones(game, character=""):
 
 
 @app.get("/zones/eql", response_class=HTMLResponse)
-def zones_report_eql(request: Request, character: str = ""):
-    rows = _compute_zones("eql", character)
+def zones_report_eql(request: Request, character: str = "", zone: str = "", start_ts: str = "", end_ts: str = ""):
+    searched = bool(character or zone or start_ts or end_ts)
+    rows = _compute_zones("eql", character, zone, start_ts, end_ts) if searched else []
     return templates.TemplateResponse(request, "zones.html", {
         "rows": rows, "game": "eql", "game_label": "EQ Legends",
-        "filters": {"character": character},
+        "filters": {"character": character, "zone": zone, "start_ts": start_ts, "end_ts": end_ts},
+        "searched": searched,
     })
 
 
 @app.get("/zones/eq2", response_class=HTMLResponse)
-def zones_report_eq2(request: Request, character: str = ""):
-    rows = _compute_zones("eq2", character)
+def zones_report_eq2(request: Request, character: str = "", zone: str = "", start_ts: str = "", end_ts: str = ""):
+    searched = bool(character or zone or start_ts or end_ts)
+    rows = _compute_zones("eq2", character, zone, start_ts, end_ts) if searched else []
     return templates.TemplateResponse(request, "zones.html", {
         "rows": rows, "game": "eq2", "game_label": "EverQuest II",
-        "filters": {"character": character},
+        "filters": {"character": character, "zone": zone, "start_ts": start_ts, "end_ts": end_ts},
+        "searched": searched,
     })
 
 
@@ -1317,15 +1366,17 @@ def _suggest_npc_type(name, rare_or_vendor_stats):
     return "npc"
 
 
-def _compute_npc_list(game, search=""):
+def _compute_npc_list(game, search="", zone=""):
     sql = (
         "WITH npc_events AS ("
-        "  SELECT ev.source_name AS npc, ev.event_type, ev.amount, ev.extra "
+        "  SELECT ev.source_name AS npc, ev.event_type, ev.amount, ev.extra, "
+        f"    {_base_zone_expr()} AS zone "
         "  FROM events ev JOIN games g ON ev.game_id=g.id "
         "  WHERE g.code=%s AND ev.event_type IN ('con','npc_dialogue','vendor_buy','vendor_sell','loot') "
         "    AND ev.source_name IS NOT NULL "
         "  UNION ALL "
-        "  SELECT ev.target_name AS npc, ev.event_type, ev.amount, ev.extra "
+        "  SELECT ev.target_name AS npc, ev.event_type, ev.amount, ev.extra, "
+        f"    {_base_zone_expr()} AS zone "
         "  FROM events ev JOIN games g ON ev.game_id=g.id "
         "  WHERE g.code=%s AND ev.event_type='death' AND ev.target_name IS NOT NULL AND ev.target_type != 'you'"
         ") "
@@ -1335,13 +1386,19 @@ def _compute_npc_list(game, search=""):
         "  MAX(CASE WHEN event_type='con' THEN JSON_EXTRACT(extra,'$.rare') END) = 'true' AS rare, "
         "  (SUM(CASE WHEN event_type IN ('vendor_buy','vendor_sell') THEN 1 ELSE 0 END) > 0) AS vendor, "
         "  SUM(CASE WHEN event_type='npc_dialogue' THEN 1 ELSE 0 END) AS dialogue_lines, "
-        "  SUM(CASE WHEN event_type='death' THEN 1 ELSE 0 END) AS kills "
+        "  SUM(CASE WHEN event_type='death' THEN 1 ELSE 0 END) AS kills, "
+        "  GROUP_CONCAT(DISTINCT zone ORDER BY zone SEPARATOR ', ') AS zones "
         "FROM npc_events GROUP BY npc"
     )
     params = [game, game]
+    having_clauses, having_params = [], []
     if search:
-        sql += " HAVING npc LIKE %s"
-        params.append(f"%{search}%")
+        having_clauses.append("npc LIKE %s"); having_params.append(f"%{search}%")
+    if zone:
+        having_clauses.append("zones LIKE %s"); having_params.append(f"%{zone}%")
+    if having_clauses:
+        sql += " HAVING " + " AND ".join(having_clauses)
+        params += having_params
     sql += " ORDER BY npc"
 
     conn = db.get_connection()
@@ -1475,18 +1532,20 @@ def _compute_npc_detail(game, name, tier="all"):
 
 
 @app.get("/npcs/eql", response_class=HTMLResponse)
-def npcs_list_eql(request: Request, search: str = ""):
-    rows = _compute_npc_list("eql", search)
+def npcs_list_eql(request: Request, search: str = "", zone: str = ""):
+    rows = _compute_npc_list("eql", search, zone) if (search or zone) else []
     return templates.TemplateResponse(request, "npc_list.html", {
-        "rows": rows, "game": "eql", "game_label": "EQ Legends", "search": search,
+        "rows": rows, "game": "eql", "game_label": "EQ Legends",
+        "search": search, "zone": zone, "searched": bool(search or zone),
     })
 
 
 @app.get("/npcs/eq2", response_class=HTMLResponse)
-def npcs_list_eq2(request: Request, search: str = ""):
-    rows = _compute_npc_list("eq2", search)
+def npcs_list_eq2(request: Request, search: str = "", zone: str = ""):
+    rows = _compute_npc_list("eq2", search, zone) if (search or zone) else []
     return templates.TemplateResponse(request, "npc_list.html", {
-        "rows": rows, "game": "eq2", "game_label": "EverQuest II", "search": search,
+        "rows": rows, "game": "eq2", "game_label": "EverQuest II",
+        "search": search, "zone": zone, "searched": bool(search or zone),
     })
 
 

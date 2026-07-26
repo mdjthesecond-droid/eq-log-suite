@@ -6,9 +6,11 @@
 
 <ul>
   <li><a href="/loot/{{ game }}">Loot</a> -- drop table per NPC killed: item, zone, quantity, chance% (drops / kills, not just a drop count).</li>
+  {% if game == 'eq2' %}
   <li><a href="/gathering/{{ game }}">Gathering</a> -- loot table per node: item, zone, drop chance, avg/total quantity, rare rate.</li>
+  {% endif %}
   <li><a href="/attacks/{{ game }}">Attacks</a> -- per-attack (melee verb or spell) breakdown: hit/crit rate, evasion, resist rate, min/avg/max damage split by hit vs crit.</li>
-  <li><a href="/zones/{{ game }}">Zones</a> -- one row per zone visit: entered/left timestamps, first/last fight, total damage, DPS, kills, hit%/crit%.</li>
+  <li><a href="/zones/{{ game }}">Zone Encounters</a> -- one row per zone visit: entered/left timestamps, first/last fight, total damage, DPS, kills, hit%/crit%.</li>
   <li><a href="/zoneinfo/{{ game }}">Zone Info</a> -- one row per zone (all instance tiers combined): connections in/out, NPCs seen, loot, quest items, level range, rare mobs.</li>
   <li><a href="/npcs/{{ game }}">NPCs</a> -- searchable NPC roster: zones seen, level range, rare/vendor flags, sold items, dialogue transcript.</li>
   {% if game == 'eql' %}

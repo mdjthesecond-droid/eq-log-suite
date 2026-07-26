@@ -1,8 +1,9 @@
 # EQ Log Suite
 
 [![GitHub repo](https://img.shields.io/badge/GitHub-eq--log--suite-blue?logo=github)](https://github.com/mdjthesecond-droid/eq-log-suite)
+[![License: GPLv2](https://img.shields.io/badge/License-GPLv2-blue.svg)](LICENSE)
 
-Personal EverQuest-family log parser: full combat breakdown into MySQL/MariaDB,
+EverQuest-family log parser: full combat breakdown into MySQL/MariaDB,
 browsable/filterable through a web UI (raw SQL or point-and-click), a live
 in-game overlay, and user-editable alert rules. Multi-game by design -- one
 small parser plugin per game feeds a common schema, so the UI never changes.
@@ -10,6 +11,15 @@ small parser plugin per game feeds a common schema, so the UI never changes.
 Currently supports:
 - **eql** -- EverQuest Legends (classic EQ log format)
 - **eq2** -- EverQuest II
+
+Licensed under GPLv2 -- see [`LICENSE`](LICENSE).
+
+## Local use only
+
+The web UI (`eq_log_suite/web/app.py`) has no authentication. It's designed
+to run on `localhost` for a single player, not to be exposed on a network or
+the internet. If you want to share it with others, put it behind your own
+auth/reverse proxy rather than binding it publicly as-is.
 
 ## One-time setup
 
@@ -32,68 +42,67 @@ sudo systemctl enable --now mariadb
 sudo mariadb -e "CREATE DATABASE eqlogs; CREATE USER 'eqlogs'@'localhost' IDENTIFIED BY 'yourpassword'; GRANT ALL PRIVILEGES ON eqlogs.* TO 'eqlogs'@'localhost'; FLUSH PRIVILEGES;"
 ```
 
-## Everyday use -- desktop launchers
+## Everyday use -- launching manually or via desktop launchers
 
-Once set up, you don't need a terminal or this venv activated by hand. Four
-entries are installed in your application launcher (search "EQ Log Suite" in
-the KDE app menu, or use the icons directly):
-
-- **EQ Log Suite - Tailer** -- starts just the live tailer. This is the
-  normal one to click before you play.
-- **EQ Log Suite - Web UI** -- starts the web server (if not already running)
-  and opens it in your browser at http://localhost:8000. This is where you
-  actually watch things live (`/live`, `/zones`, `/gathering`) -- see below
-  for why.
-- **EQ Log Suite - Overlay** -- starts the tailer plus the in-game overlay
-  window. Not part of normal play right now: KWin gives a focused fullscreen
-  game its own stacking layer above ordinary "always on top" windows, so the
-  overlay only reliably renders when the game isn't fullscreen-focused (menus,
-  loading screens, or if you ever switch a game to true windowed mode).
-  Confirmed this isn't a simple KWin setting -- `WindowsBlockCompositing` is
-  already `false` here, so the compositor isn't fully suspending for
-  fullscreen; it's KWin's fullscreen stacking layer specifically. The real
-  fix (below) is graphics-API-level overlay injection, same as MangoHud/
-  Steam's own overlay.
-- **EQ Log Suite - Stop** -- stops the tailer, overlay, MangoHud alert
-  writer, and web UI, whichever of them are running.
-
-They're backed by plain shell scripts in `bin/` (`start-tailer.sh`,
-`start-overlay.sh`, `start-mangohud-alerts.sh`, `start-web.sh`, `stop-all.sh`)
-if you'd rather run them from a terminal, or want to see what they're doing.
+The simplest path is the shell scripts in `bin/` (`start-tailer.sh`,
+`start-overlay.sh`, `start-mangohud-alerts.sh`, `start-web.sh`, `stop-all.sh`).
 All are safe to re-run -- they check what's already running before starting
 anything new. Logs from each go to `logs/tailer.log`, `logs/overlay.log`,
 `logs/mangohud_alerts.log`, `logs/web.log`.
 
-The desktop entries live in `~/.local/share/applications/eq-log-suite-*.desktop`
-and point at the scripts in this project's `bin/` directory by absolute path,
-so they'll keep working as long as this project stays at
-`/var/home/myself/claudes/eq-log-suite/`.
+- **Tailer** (`start-tailer.sh`) -- starts just the live tailer. This is the
+  normal one to run before you play.
+- **Web UI** (`start-web.sh`) -- starts the web server (if not already
+  running) at http://localhost:8000. This is where you actually watch
+  things live (`/live`, `/zones`, `/gathering`) -- see below for why.
+- **Overlay** (`start-overlay.sh`) -- starts the tailer plus the in-game
+  overlay window. On Linux with a compositor like KWin, a focused
+  fullscreen game typically gets its own stacking layer above ordinary
+  "always on top" windows, so a plain GTK/Qt overlay window like this one
+  only reliably renders when the game isn't fullscreen-focused (menus,
+  loading screens, or true windowed mode). That's a compositor-level
+  limitation, not something fixable from app settings like
+  `WindowsBlockCompositing` -- the real fix (below) is graphics-API-level
+  overlay injection, same approach as MangoHud/Steam's own overlay.
+- **Stop** (`stop-all.sh`) -- stops the tailer, overlay, MangoHud alert
+  writer, and web UI, whichever of them are running.
+
+If you'd like desktop-launcher entries (e.g. KDE's application menu) instead
+of running scripts from a terminal, create `.desktop` files in
+`~/.local/share/applications/` that point at the scripts in this project's
+`bin/` directory by absolute path. They'll keep working as long as the
+project stays at that path.
 
 ## Alerts over fullscreen (MangoHud)
 
 The GTK overlay above doesn't reliably render over a focused fullscreen
-game (see its note above); MangoHud does, because it draws inside the
-game's own Vulkan/GL swapchain rather than being a window KWin has to
-stack. Confirmed working on this machine against EQ2 running through Proton
-via a Steam non-Steam-game shortcut.
+game on Linux (see its note above); MangoHud does, because it draws inside
+the game's own Vulkan/GL swapchain rather than being a window the
+compositor has to stack. Confirmed working against EQ2 running through
+Proton via a Steam non-Steam-game shortcut. (Windows users: the GTK overlay
+and this MangoHud path are Linux-specific; the parser, database, and web UI
+underneath are all cross-platform.)
 
 Setup (one-time):
 
-1. Bazzite already ships MangoHud -- nothing to install.
-2. Right-click the EQ2 shortcut in Steam -> Properties -> Launch Options:
+1. Install [MangoHud](https://github.com/flightlessmango/MangoHud) if it's
+   not already on your system (Bazzite and some other distros ship it
+   preinstalled).
+2. Right-click the game's shortcut in Steam -> Properties -> Launch Options:
    ```
-   MANGOHUD_CONFIGFILE=/home/myself/.config/MangoHud/eq_log_suite.conf mangohud %command%
+   MANGOHUD_CONFIGFILE=$HOME/.config/MangoHud/eq_log_suite.conf mangohud %command%
    ```
    Using a dedicated config file (not `~/.config/MangoHud/MangoHud.conf`)
    keeps this from touching whatever MangoHud settings you use for other
    games.
 3. Create that config file with two `exec`/`custom_text` pairs -- one for a
-   live DPS readout, one for alerts:
+   live DPS readout, one for alerts. Replace `<path-to-eq-log-suite>` with
+   this project's actual location on disk:
    ```
    position=top-left
-   exec=cat /var/home/myself/claudes/eq-log-suite/logs/mangohud_dps.txt
+   exec=cat <path-to-eq-log-suite>/logs/mangohud_dps.txt
    custom_text=DPS
-   exec=cat /var/home/myself/claudes/eq-log-suite/logs/mangohud_alert.txt
+   exec=cat <path-to-eq-log-suite>/logs/mangohud_alert.txt
    custom_text=Alert
    ```
    `exec`'s output is the value shown; `custom_text` is just its label --
@@ -117,10 +126,10 @@ Setup (one-time):
    from them, silently dropping the `exec=` lines since they're not exposed
    in the GUI. Re-add the two pairs above after any GUI-driven edit.
 
-Everyday use: **EQ Log Suite - MangoHud Alerts** (or `bin/start-mangohud-alerts.sh`)
-instead of the regular Overlay launcher. It starts the tailer (if not
-already running) plus `eq_log_suite/overlay/mangohud_writer.py`, which
-listens on the same alert-broadcast socket the GTK overlay uses and writes:
+Everyday use: `bin/start-mangohud-alerts.sh` instead of the regular Overlay
+launcher. It starts the tailer (if not already running) plus
+`eq_log_suite/overlay/mangohud_writer.py`, which listens on the same
+alert-broadcast socket the GTK overlay uses and writes:
 - the live DPS/hit%/crit% snapshot to `logs/mangohud_dps.txt`, refreshed
   every 0.5s while active and frozen (not cleared) once combat pauses, same
   behavior as the GTK overlay's own DPS meter;
@@ -138,9 +147,9 @@ per-message-colored annotations, this shows one line per slot: whatever
 fired most recently. Fine for "something just happened," not a substitute
 for the richer overlay if you're ever in windowed mode.
 
-MariaDB itself is a systemd service (`sudo systemctl enable --now mariadb`
-was run during setup), so it starts automatically on boot -- nothing to
-launch for that.
+MariaDB itself is typically run as a systemd service
+(`sudo systemctl enable --now mariadb`, from setup above), so it starts
+automatically on boot -- nothing to launch for that.
 
 ## New/rotated log files (new character, new server, EQ2 `/log` toggles)
 
