@@ -13,3 +13,4 @@ database:
 log_roots:
   eql: /home/myself/eql/Logs
   eq2: /home/myself/eq2/logs
+  eq: /home/myself/eq/Logs

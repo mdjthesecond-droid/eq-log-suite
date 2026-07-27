@@ -115,6 +115,13 @@ def eq2_hub(request: Request):
     })
 
 
+@app.get("/eq", response_class=HTMLResponse)
+def eq_hub(request: Request):
+    return templates.TemplateResponse(request, "game_hub.html", {
+        "game": "eq", "game_label": "EverQuest",
+    })
+
+
 @app.get("/query", response_class=HTMLResponse)
 def query_form(request: Request):
     return templates.TemplateResponse(request, "query.html", {"sql": "", "rows": [], "columns": [], "error": ""})
@@ -454,6 +461,19 @@ def loot_report_eql(request: Request, npc: str = "", item: str = "", zone: str =
     })
 
 
+@app.get("/loot/eq", response_class=HTMLResponse)
+def loot_report_eq(request: Request, npc: str = "", item: str = "", zone: str = ""):
+    rows, truncated = _compute_loot("eq", npc, item, zone)
+    return templates.TemplateResponse(request, "loot.html", {
+        "rows": rows,
+        "truncated": truncated,
+        "game": "eq",
+        "game_label": "EverQuest",
+        "unresolved_zone_starts": _unresolved_zone_starts("eq"),
+        "filters": {"npc": npc, "item": item, "zone": zone},
+    })
+
+
 @app.get("/loot/eq2", response_class=HTMLResponse)
 def loot_report_eq2(request: Request, npc: str = "", item: str = "", zone: str = ""):
     rows, truncated = _compute_loot("eq2", npc, item, zone)
@@ -500,6 +520,59 @@ def _compute_quests(game, character="", quest="", zone="", npc=""):
         f"  WHERE ev.event_type='quest' {inner_where}"
         ") t "
         f"{outer_where} ORDER BY ts DESC"
+    )
+
+    conn = db.get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, inner_params + outer_params)
+            return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def _compute_tasks(game, character="", task="", npc="", zone=""):
+    # Live EQ's structured "Tasks" system (task_assigned/task_reward, see
+    # parsers/eq.py) -- distinct from /quests/{game}'s dialogue transcript.
+    # Neither the assignment nor the reward line names an NPC or zone, so
+    # both are correlated the same way /quests already does: zone via
+    # whichever zone_change happened most recently before the assignment,
+    # npc via whichever NPC most recently spoke (npc_dialogue, not hail --
+    # the NPC's own line is what actually explains/hands out the task)
+    # before it. reward_at is the nearest task_reward for that same
+    # character+task name at or after the assignment -- known gap: a
+    # sub-task's reward can be granted under a different name than the task
+    # was assigned under (confirmed real: assigned 'Achievements', reward
+    # granted for 'Mastering Achievements'), so that reward won't link back
+    # to its assignment here; it's not dropped from the game, just from
+    # this correlation.
+    inner_clauses, inner_params = ["g.code = %s"], [game]
+    if character:
+        inner_clauses.append("c.name = %s"); inner_params.append(character)
+    inner_where = f"AND {' AND '.join(inner_clauses)}"
+
+    outer_clauses, outer_params = [], []
+    if task:
+        outer_clauses.append("task LIKE %s"); outer_params.append(f"%{task}%")
+    if npc:
+        outer_clauses.append("npc LIKE %s"); outer_params.append(f"%{npc}%")
+    if zone:
+        outer_clauses.append("zone LIKE %s"); outer_params.append(f"%{zone}%")
+    outer_where = f"WHERE {' AND '.join(outer_clauses)}" if outer_clauses else ""
+
+    sql = (
+        "SELECT * FROM ("
+        "  SELECT ev.ts AS assigned_at, c.name AS character_name, ev.target_name AS task, "
+        f"    {_ZONE_LOOKUP_EXPR} AS zone, "
+        "    (SELECT nd.source_name FROM events nd WHERE nd.event_type='npc_dialogue' "
+        "       AND nd.character_id=ev.character_id AND nd.ts<=ev.ts ORDER BY nd.ts DESC LIMIT 1) AS npc, "
+        "    (SELECT r.ts FROM events r WHERE r.event_type='task_reward' "
+        "       AND r.character_id=ev.character_id AND r.target_name=ev.target_name "
+        "       AND r.ts>=ev.ts ORDER BY r.ts ASC LIMIT 1) AS reward_at "
+        "  FROM events ev JOIN games g ON ev.game_id=g.id JOIN characters c ON ev.character_id=c.id "
+        f"  WHERE ev.event_type='task_assigned' {inner_where}"
+        ") t "
+        f"{outer_where} ORDER BY assigned_at DESC"
     )
 
     conn = db.get_connection()
@@ -702,6 +775,29 @@ def quests_report_eql(request: Request, character: str = "", npc: str = "", zone
     })
 
 
+@app.get("/quests/eq", response_class=HTMLResponse)
+def quests_report_eq(request: Request, character: str = "", npc: str = "", zone: str = ""):
+    rows = _compute_dialogue("eq", character, npc, zone, exclude_chatter=True)
+    truncated = len(rows) > QUESTS_RECENT_LIMIT
+    rows = sorted(rows, key=lambda r: r["ts"])[-QUESTS_RECENT_LIMIT:]
+    return templates.TemplateResponse(request, "dialogue.html", {
+        "rows": rows, "game": "eq", "game_label": "EverQuest",
+        "unresolved_zone_starts": _unresolved_zone_starts("eq"),
+        "filters": {"character": character, "npc": npc, "zone": zone},
+        "truncated": truncated, "limit": QUESTS_RECENT_LIMIT,
+    })
+
+
+@app.get("/tasks/eq", response_class=HTMLResponse)
+def tasks_report_eq(request: Request, character: str = "", task: str = "", npc: str = "", zone: str = ""):
+    rows = _compute_tasks("eq", character, task, npc, zone)
+    return templates.TemplateResponse(request, "tasks.html", {
+        "rows": rows, "game": "eq", "game_label": "EverQuest",
+        "unresolved_zone_starts": _unresolved_zone_starts("eq"),
+        "filters": {"character": character, "task": task, "npc": npc, "zone": zone},
+    })
+
+
 @app.get("/quests/eq2", response_class=HTMLResponse)
 def quests_report_eq2(request: Request, character: str = "", quest: str = "", zone: str = "", npc: str = ""):
     rows = _compute_quests("eq2", character, quest, zone, npc)
@@ -809,6 +905,11 @@ def _render_attacks(request, game, game_label, character, start_ts, end_ts):
 @app.get("/attacks/eql", response_class=HTMLResponse)
 def attacks_breakdown_eql(request: Request, character: str = "", start_ts: str = "", end_ts: str = ""):
     return _render_attacks(request, "eql", "EQ Legends", character, start_ts, end_ts)
+
+
+@app.get("/attacks/eq", response_class=HTMLResponse)
+def attacks_breakdown_eq(request: Request, character: str = "", start_ts: str = "", end_ts: str = ""):
+    return _render_attacks(request, "eq", "EverQuest", character, start_ts, end_ts)
 
 
 @app.get("/attacks/eq2", response_class=HTMLResponse)
@@ -966,6 +1067,17 @@ def zones_report_eql(request: Request, character: str = "", zone: str = "", star
     })
 
 
+@app.get("/zones/eq", response_class=HTMLResponse)
+def zones_report_eq(request: Request, character: str = "", zone: str = "", start_ts: str = "", end_ts: str = ""):
+    searched = bool(character or zone or start_ts or end_ts)
+    rows = _compute_zones("eq", character, zone, start_ts, end_ts) if searched else []
+    return templates.TemplateResponse(request, "zones.html", {
+        "rows": rows, "game": "eq", "game_label": "EverQuest",
+        "filters": {"character": character, "zone": zone, "start_ts": start_ts, "end_ts": end_ts},
+        "searched": searched,
+    })
+
+
 @app.get("/zones/eq2", response_class=HTMLResponse)
 def zones_report_eq2(request: Request, character: str = "", zone: str = "", start_ts: str = "", end_ts: str = ""):
     searched = bool(character or zone or start_ts or end_ts)
@@ -1039,17 +1151,44 @@ def _compute_zone_list(game):
             zones = sorted(r["zone"] for r in cur.fetchall() if r["zone"])
 
             cur.execute(
-                "SELECT zone, MIN(level) AS level_min, MAX(level) AS level_max, "
-                "COUNT(DISTINCT CASE WHEN rare THEN source_name END) AS rare_count FROM ("
-                "  SELECT ev.source_name, ev.amount AS level, "
-                "    JSON_EXTRACT(ev.extra,'$.rare')=true AS rare, "
-                f"    {_base_zone_expr()} AS zone "
-                "  FROM events ev JOIN games g ON ev.game_id=g.id "
-                "  WHERE ev.event_type='con' AND g.code=%s"
-                ") t WHERE zone IS NOT NULL GROUP BY zone",
+                "SELECT ev.source_name AS npc, ev.amount AS level, "
+                "  JSON_EXTRACT(ev.extra,'$.rare')=true AS rare, "
+                f"  {_base_zone_expr()} AS zone "
+                "FROM events ev JOIN games g ON ev.game_id=g.id "
+                "WHERE ev.event_type='con' AND g.code=%s",
                 (game,),
             )
-            con_by_zone = {r["zone"]: r for r in cur.fetchall()}
+            con_rows = [r for r in cur.fetchall() if r["zone"]]
+
+            # Level range is restricted to NPCs actually fought (not just
+            # /con'd) -- a zone's quest-giver/vendor/lore NPCs are often
+            # much higher level than anything you'd actually fight there,
+            # and including them skews the range upward into something
+            # misleading. "Fought" = appeared as either side of a combat
+            # event; rare_count below deliberately stays unrestricted (a
+            # rare you've conned but not yet fought is still worth knowing
+            # about).
+            cur.execute(
+                "SELECT DISTINCT name FROM ("
+                "  SELECT e.source_name AS name FROM events e JOIN games g ON e.game_id=g.id "
+                "    WHERE g.code=%s AND e.event_type IN "
+                "      ('melee','spell_damage','spell_effect','spell_resist','death') "
+                "  UNION "
+                "  SELECT e.target_name AS name FROM events e JOIN games g ON e.game_id=g.id "
+                "    WHERE g.code=%s AND e.event_type IN "
+                "      ('melee','spell_damage','spell_effect','spell_resist','death')"
+                ") t WHERE name IS NOT NULL",
+                (game, game),
+            )
+            fought_names = {r["name"] for r in cur.fetchall()}
+
+            con_by_zone = {}
+            for r in con_rows:
+                entry = con_by_zone.setdefault(r["zone"], {"levels": [], "rare_names": set()})
+                if r["rare"]:
+                    entry["rare_names"].add(r["npc"])
+                if r["npc"] in fought_names:
+                    entry["levels"].append(r["level"])
 
             cur.execute(
                 "SELECT zone, COUNT(DISTINCT source_name) AS npc_count FROM ("
@@ -1069,10 +1208,11 @@ def _compute_zone_list(game):
 
     rows = []
     for zone in zones:
-        con_stats = con_by_zone.get(zone, {})
+        con_stats = con_by_zone.get(zone, {"levels": [], "rare_names": set()})
         override = overrides.get(zone)
-        level_min = con_stats.get("level_min")
-        level_max = con_stats.get("level_max")
+        levels = con_stats["levels"]
+        level_min = min(levels) if levels else None
+        level_max = max(levels) if levels else None
         if override:
             if override["level_min_override"] is not None:
                 level_min = override["level_min_override"]
@@ -1083,7 +1223,7 @@ def _compute_zone_list(game):
             "level_min": level_min,
             "level_max": level_max,
             "npc_count": npc_by_zone.get(zone, 0),
-            "rare_count": con_stats.get("rare_count") or 0,
+            "rare_count": len(con_stats["rare_names"]),
             "note": override["note"] if override else None,
         })
     return rows
@@ -1305,6 +1445,17 @@ def _compute_zone_detail(game, zone, tier="all", solo="any"):
             )
             loot = cur.fetchall()
 
+            # ground spawns picked up here -- no source NPC (unlike loot
+            # above), just an item and how many times it's been picked up.
+            cur.execute(
+                "SELECT ev.target_name AS item, COUNT(*) AS times "
+                "FROM events ev JOIN games g ON ev.game_id=g.id "
+                f"WHERE ev.event_type='ground_spawn' AND g.code=%s AND {match_where} "
+                "GROUP BY ev.target_name ORDER BY item",
+                [game] + match_params,
+            )
+            ground_spawns = cur.fetchall()
+
             # quest/reward items (non-currency reward text) given by NPCs here
             cur.execute(
                 "SELECT ev.source_name AS npc, "
@@ -1342,6 +1493,7 @@ def _compute_zone_detail(game, zone, tier="all", solo="any"):
         "variants": variants,
         "npcs": npcs,
         "loot": loot,
+        "ground_spawns": ground_spawns,
         "quest_items": quest_items,
         "rares": rares,
         "override": override,
@@ -1361,6 +1513,14 @@ def zoneinfo_list_eq2(request: Request):
     rows = _compute_zone_list("eq2")
     return templates.TemplateResponse(request, "zoneinfo_list.html", {
         "rows": rows, "game": "eq2", "game_label": "EverQuest II",
+    })
+
+
+@app.get("/zoneinfo/eq", response_class=HTMLResponse)
+def zoneinfo_list_eq(request: Request):
+    rows = _compute_zone_list("eq")
+    return templates.TemplateResponse(request, "zoneinfo_list.html", {
+        "rows": rows, "game": "eq", "game_label": "EverQuest",
     })
 
 
@@ -1386,6 +1546,11 @@ def zoneinfo_detail_eql(request: Request, zone: str, tier: str = "all", solo: st
 @app.get("/zoneinfo/eq2/detail", response_class=HTMLResponse)
 def zoneinfo_detail_eq2(request: Request, zone: str, tier: str = "all", solo: str = "any"):
     return _render_zoneinfo_detail(request, "eq2", "EverQuest II", zone, tier, solo)
+
+
+@app.get("/zoneinfo/eq/detail", response_class=HTMLResponse)
+def zoneinfo_detail_eq(request: Request, zone: str, tier: str = "all", solo: str = "any"):
+    return _render_zoneinfo_detail(request, "eq", "EverQuest", zone, tier, solo)
 
 
 @app.post("/zoneinfo/set-level")
@@ -1745,6 +1910,15 @@ def npcs_list_eq2(request: Request, search: str = "", zone: str = ""):
     })
 
 
+@app.get("/npcs/eq", response_class=HTMLResponse)
+def npcs_list_eq(request: Request, search: str = "", zone: str = ""):
+    rows = _compute_npc_list("eq", search, zone) if (search or zone) else []
+    return templates.TemplateResponse(request, "npc_list.html", {
+        "rows": rows, "game": "eq", "game_label": "EverQuest",
+        "search": search, "zone": zone, "searched": bool(search or zone),
+    })
+
+
 @app.get("/npcs/eql/detail", response_class=HTMLResponse)
 def npc_detail_eql(request: Request, npc: str, tier: str = "all"):
     detail = _compute_npc_detail("eql", npc, tier)
@@ -1758,6 +1932,14 @@ def npc_detail_eq2(request: Request, npc: str, tier: str = "all"):
     detail = _compute_npc_detail("eq2", npc, tier)
     return templates.TemplateResponse(request, "npc_detail.html", {
         "game": "eq2", "game_label": "EverQuest II", **detail,
+    })
+
+
+@app.get("/npcs/eq/detail", response_class=HTMLResponse)
+def npc_detail_eq(request: Request, npc: str, tier: str = "all"):
+    detail = _compute_npc_detail("eq", npc, tier)
+    return templates.TemplateResponse(request, "npc_detail.html", {
+        "game": "eq", "game_label": "EverQuest", **detail,
     })
 
 
@@ -2664,7 +2846,9 @@ def import_rescan(request: Request):
     from eq_log_suite.tailer import PID_PATH
 
     log_roots = db.config().get("log_roots", {})
-    new_sources = discovery.scan_and_import(log_roots.get("eql", ""), log_roots.get("eq2", ""))
+    new_sources = discovery.scan_and_import(
+        log_roots.get("eql", ""), log_roots.get("eq2", ""), log_roots.get("eq", "")
+    )
 
     tailer_notified = False
     tailer_error = None

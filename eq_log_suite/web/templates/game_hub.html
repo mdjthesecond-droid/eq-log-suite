@@ -11,12 +11,15 @@
   {% endif %}
   <li><a href="/attacks/{{ game }}">Attacks</a> -- per-attack (melee verb or spell) breakdown: hit/crit rate, evasion, resist rate, min/avg/max damage split by hit vs crit.</li>
   <li><a href="/zones/{{ game }}">Zone Encounters</a> -- one row per zone visit: entered/left timestamps, first/last fight, total damage, DPS, kills, hit%/crit%.</li>
-  <li><a href="/zoneinfo/{{ game }}">Zone Info</a> -- one row per zone (all instance tiers combined): connections in/out, NPCs seen, loot, quest items, level range, rare mobs.</li>
+  <li><a href="/zoneinfo/{{ game }}">Zone Info</a> -- one row per zone (all instance tiers combined): connections in/out, NPCs seen, loot, ground spawns, quest items, level range, rare mobs.</li>
   <li><a href="/npcs/{{ game }}">NPCs</a> -- searchable NPC roster: zones seen, level range, rare/vendor flags, sold items, dialogue transcript.</li>
-  {% if game == 'eql' %}
+  {% if game in ('eql', 'eq') %}
   <li><a href="/quests/{{ game }}">Quests</a> -- NPC dialogue transcript (hails, says, bracketed keywords, rewards), zone filled in by correlation. No structured quest-completion event exists for classic EQ, so this is a raw transcript rather than a completions list.</li>
   {% else %}
   <li><a href="/quests/{{ game }}">Quests</a> -- completions with zone and NPC filled in by correlation, plus reward.</li>
+  {% endif %}
+  {% if game == 'eq' %}
+  <li><a href="/tasks/{{ game }}">Tasks</a> -- live EQ's structured Tasks system: assigned/rewarded per task, with NPC and zone filled in by correlation. Distinct from Quests above, which has no logged completion signal at all.</li>
   {% endif %}
 </ul>
 

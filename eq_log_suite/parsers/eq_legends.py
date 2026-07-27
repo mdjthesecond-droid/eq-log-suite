@@ -613,6 +613,21 @@ def h_loot(m):
     )
 
 
+def h_ground_spawn(m):
+    # "You picked up Gloomingdeep Mushrooms." -- a ground spawn (item sitting
+    # in the world, not looted off a corpse), no source NPC to attribute it
+    # to. The same sentence also fires for one-off scripted quest item
+    # pickups (e.g. "You picked up Poxan's Sword.") -- confirmed real, not
+    # distinguishable from a true ground spawn by text alone, so both land
+    # here as event_type='ground_spawn'.
+    return ParsedEvent(
+        ts=None, raw_line=None, event_type="ground_spawn",
+        source_name=None, source_type=None,
+        target_name=m.group("item"), target_type="item",
+        verb=None, amount=None, outcome=None,
+    )
+
+
 def h_faction(m):
     return ParsedEvent(
         ts=None, raw_line=None, event_type="faction",
@@ -793,6 +808,12 @@ class EQLegendsParser(GameParser):
         (re.compile(
             r"^You looted (?:(?P<qty>\d+) )?(?P<item>.+?) from (?P<source>.+?)'s corpse"
         ), h_loot),
+
+        # "You picked up Gloomingdeep Mushrooms." -- must come after h_loot's
+        # "You looted ..." pattern above so a real loot line (a different
+        # sentence shape entirely, but both start with "You") never risks
+        # being shadowed.
+        (re.compile(r"^You picked up (?P<item>.+?)\.$"), h_ground_spawn),
 
         # "You offered 1 Letter For Doug to Doug." -- the actual turn-in action.
         (re.compile(r"^You offered (?P<qty>\d+) (?P<item>.+?) to (?P<npc>.+?)\.$"), h_item_offer),

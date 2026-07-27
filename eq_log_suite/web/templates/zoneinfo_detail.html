@@ -113,6 +113,18 @@ than you've taken).</p>
 </div>
 {% else %}<p>None yet.</p>{% endif %}
 
+<h2>Ground spawns</h2>
+<p style="opacity:0.7;">Items picked up directly off the ground here (no source NPC), rather than
+looted from a corpse.</p>
+{% if ground_spawns %}
+<table class="sortable">
+  <thead><tr><th>item</th><th>times</th></tr></thead>
+  <tbody>
+    {% for g in ground_spawns %}<tr><td>{{ g.item }}</td><td>{{ g.times }}</td></tr>{% endfor %}
+  </tbody>
+</table>
+{% else %}<p>None yet.</p>{% endif %}
+
 <h2>Quest items received here</h2>
 <p style="opacity:0.7;">Non-currency rewards handed over by an NPC here -- classic EQ has no logged
 "quest" identity, so this is the closest available signal (see <a href="/quests/{{ game }}">Quests</a>

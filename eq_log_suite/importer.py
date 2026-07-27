@@ -17,7 +17,7 @@ from eq_log_suite.parsers.registry import detect_parser, get_parser
 
 BATCH_SIZE = 500
 
-GAME_NAMES = {"eql": "EverQuest Legends", "eq2": "EverQuest II"}
+GAME_NAMES = {"eql": "EverQuest Legends", "eq2": "EverQuest II", "eq": "EverQuest"}
 
 
 def guess_character_from_filename(path: str) -> str | None:

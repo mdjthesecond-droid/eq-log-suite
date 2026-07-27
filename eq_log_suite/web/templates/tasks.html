@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block title %}Tasks -- {{ game_label }}{% endblock %}
+{% block content %}
+<h1>Tasks -- {{ game_label }}</h1>
+<p>Live EQ's structured Tasks system -- a real assigned/rewarded lifecycle per task, unlike the
+old-style "quests" (see <a href="/quests/{{ game }}">Quests</a>), which are just a raw NPC dialogue
+transcript with no logged completion signal at all. Neither the assignment nor the reward line
+names an NPC or zone, so both are correlated: zone is whatever zone_change happened most recently
+before the assignment; npc is whichever NPC most recently spoke before it (best-effort -- not a
+guaranteed source, just whoever was talking right before). A blank reward means no matching
+task_reward has been seen yet for that task name -- some sub-tasks grant their reward under a
+different name than they were assigned under, so a real reward can still fail to show up here.</p>
+
+<form method="get" action="/tasks/{{ game }}">
+  <input name="character" placeholder="character" value="{{ filters.character }}">
+  <input name="task" placeholder="task contains" value="{{ filters.task }}">
+  <input name="npc" placeholder="npc contains" value="{{ filters.npc }}">
+  <input name="zone" placeholder="zone contains" value="{{ filters.zone }}">
+  <button type="submit">Filter</button>
+</form>
+
+{% if unresolved_zone_starts %}
+<div style="border:1px solid #c9a227; border-radius:6px; padding:0.8rem 1rem; margin-bottom:1rem;">
+  <strong>&#9888; {{ unresolved_zone_starts|length }} character(s) have activity logged before their
+  first zone was ever recorded -- confirm what zone they actually started in:</strong>
+  {% for u in unresolved_zone_starts %}
+  <form method="post" action="/zone-start/set" style="display:flex; gap:0.5rem; align-items:center; margin-top:0.5rem;">
+    <input type="hidden" name="character_id" value="{{ u.character_id }}">
+    <input type="hidden" name="next" value="/tasks/{{ game }}">
+    <span style="min-width:220px;">{{ u.character_name }} <span style="opacity:0.7;">(earliest: {{ u.earliest_ts }})</span></span>
+    <input name="zone" placeholder="actual zone, e.g. The Steamfont Mountains" required style="width:280px;">
+    <input name="note" placeholder="note (optional)">
+    <button type="submit">Confirm</button>
+  </form>
+  {% endfor %}
+</div>
+{% endif %}
+
+{% if not rows %}
+<p>No tasks assigned yet{% if filters.character or filters.task or filters.npc or filters.zone %} matching those filters{% endif %}.</p>
+{% endif %}
+
+<div class="scroll-frame">
+<table class="sortable">
+  <thead>
+    <tr><th>assigned</th><th>character</th><th>task</th><th>npc</th><th>zone</th><th>rewarded</th></tr>
+  </thead>
+  <tbody>
+    {% for r in rows %}
+    <tr>
+      <td>{{ r.assigned_at }}</td>
+      <td>{{ r.character_name }}</td>
+      <td>{{ r.task }}</td>
+      <td>{{ r.npc or '' }}</td>
+      <td>{{ r.zone or '' }}</td>
+      <td>{{ r.reward_at or '' }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endblock %}

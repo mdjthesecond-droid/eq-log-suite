@@ -35,6 +35,15 @@ def _discover_eql(root: str) -> list[str]:
     return [str(p) for p in sorted(root_path.glob("*.txt")) if EQLOG_NAME_RE.match(p.name)]
 
 
+def _discover_eq(root: str) -> list[str]:
+    # Same eqlog_<Character>_<Server>.txt naming as EQL -- both are
+    # EQ-client-derived, see eq_log_suite/parsers/eq.py.
+    root_path = Path(root)
+    if not root_path.is_dir():
+        return []
+    return [str(p) for p in sorted(root_path.glob("*.txt")) if EQLOG_NAME_RE.match(p.name)]
+
+
 def _discover_eq2(root: str) -> list[str]:
     root_path = Path(root)
     if not root_path.is_dir():
@@ -104,7 +113,7 @@ def _resolve_live_status(character_ids: set[int]) -> None:
         conn.close()
 
 
-def scan_and_import(eql_root: str, eq2_root: str) -> list[dict]:
+def scan_and_import(eql_root: str, eq2_root: str, eq_root: str = "") -> list[dict]:
     """Returns the (possibly now-live) log_sources rows for any
     newly-discovered files."""
     conn = db.get_connection()
@@ -122,6 +131,15 @@ def scan_and_import(eql_root: str, eq2_root: str) -> list[dict]:
         character = guess_character_from_filename(path) or "Unknown"
         server = guess_server_from_filename(path)
         row = _import_new_file(path, "eql", character, server)
+        newly_added.append(row)
+        touched_character_ids.add(row["character_id"])
+
+    for path in _discover_eq(eq_root):
+        if path in tracked:
+            continue
+        character = guess_character_from_filename(path) or "Unknown"
+        server = guess_server_from_filename(path)
+        row = _import_new_file(path, "eq", character, server)
         newly_added.append(row)
         touched_character_ids.add(row["character_id"])
 

@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Encounter Breakdown{% endblock %}
 {% block content %}
+<div id="breakdown-params" data-character="{{ filters.character }}" data-start-ts="{{ start_ts }}" data-stop-ts="{{ stop_ts or '' }}" hidden></div>
 <h1>Encounter Breakdown</h1>
 <p>{{ filters.character }} -- {{ start_ts.replace("T", " ") }} to {{ stop_ts.replace("T", " ") }}
 -- {{ duration_s }}s total duration</p>
@@ -50,7 +51,14 @@
 {% for n in npcs %}
 <div style="border:1px solid var(--border); border-radius:6px; padding:0.8rem 1rem; margin-bottom:1.5rem;">
 
-  <h2 style="margin-top:0;">{{ n.npc }}</h2>
+  <h2 style="margin-top:0;">
+    {{ n.npc }}
+    <button type="button" class="npc-log-toggle" data-mob="{{ n.npc }}"
+      style="font-size:0.8rem; font-weight:400; margin-left:0.6rem;">show log</button>
+  </h2>
+  <div class="npc-log-block" style="display:none; max-height:320px; overflow-y:auto; font-family:monospace;
+    font-size:0.8rem; white-space:pre-wrap; background:#12141c; border:1px solid var(--border);
+    border-radius:4px; padding:0.5rem; margin:0 0 0.8rem 0;"></div>
   <p style="opacity:0.8;">{{ start_ts.replace("T", " ") }} to {{ stop_ts.replace("T", " ") }} -- {{ duration_s }}s total duration</p>
   <table style="margin-bottom:1rem;">
     <tr><td style="opacity:0.7; padding-right:1rem;">damage done <strong>to</strong> {{ n.npc }}</td>
@@ -116,6 +124,34 @@
 {% endfor %}
 
 <script>
+  // Direct log entries for one NPC's whole breakdown block, filtered to
+  // this window + that mob name -- same /api/encounters/log endpoint and
+  // lazy-fetch-once-then-cache pattern /encounters already uses for its
+  // per-mob log buttons.
+  const breakdownParamsEl = document.getElementById("breakdown-params");
+  const breakdownLogParams = {
+    character: breakdownParamsEl.dataset.character,
+    start_ts: breakdownParamsEl.dataset.startTs,
+    stop_ts: breakdownParamsEl.dataset.stopTs,
+  };
+  document.querySelectorAll(".npc-log-toggle").forEach((button) => {
+    const block = button.closest("h2").nextElementSibling;
+    let loaded = false;
+    button.addEventListener("click", async () => {
+      const opening = block.style.display === "none";
+      block.style.display = opening ? "" : "none";
+      button.textContent = opening ? "hide log" : "show log";
+      if (opening && !loaded) {
+        loaded = true;
+        block.textContent = "Loading...";
+        const params = { ...breakdownLogParams, mob: button.dataset.mob };
+        const res = await fetch(`/api/encounters/log?${new URLSearchParams(params)}`);
+        const rows = await res.json();
+        block.textContent = rows.length ? rows.map((r) => r.raw_line).join("\n") : "No log entries.";
+      }
+    });
+  });
+
   // Summary rows are paired 1:1 with a hidden detail row right after them
   // (for expand/collapse) -- the generic table.js sorter would sort every
   // <tr> independently and scramble that pairing, so this table skips
