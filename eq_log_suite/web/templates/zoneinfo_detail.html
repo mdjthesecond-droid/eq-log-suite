@@ -64,6 +64,27 @@ than you've taken).</p>
 </ul>
 {% else %}<p style="opacity:0.7;">None confirmed here yet.</p>{% endif %}
 
+<h2>PoK Books</h2>
+<p style="opacity:0.7;">A "Plane of Knowledge Book" zone item -- a bidirectional teleport to/from
+PoK with no spell or ability cast beforehand, so it's not a walkable connection either (kept
+separate from Connections above, same as Translocators). A trip into or out of PoK with no cast
+right before it is assumed to be a book, since there's no other distinguishing signal in the log
+text.</p>
+{% if books_here %}
+<ul>
+  {% for b in books_here %}
+  <li>
+    {% if b.from_zone == zone %}
+    &rarr; <a href="/zoneinfo/{{ game }}/detail?zone={{ b.to_zone|urlencode }}">{{ b.to_zone }}</a>
+    {% else %}
+    &larr; <a href="/zoneinfo/{{ game }}/detail?zone={{ b.from_zone|urlencode }}">{{ b.from_zone }}</a>
+    {% endif %}
+    ({{ b.times }}x)
+  </li>
+  {% endfor %}
+</ul>
+{% else %}<p style="opacity:0.7;">None confirmed here yet.</p>{% endif %}
+
 <h2>Rare mobs</h2>
 {% if rares %}
 {% for r in rares %}

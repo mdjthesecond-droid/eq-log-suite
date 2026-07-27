@@ -716,7 +716,11 @@ def _compute_dialogue(game, character="", npc="", zone="", exclude_chatter=False
     seen = set()
     deduped = []
     for r in rows:
-        key = (r["character_name"], r["kind"], r["npc"], r["zone"], r["text"], r["amount"])
+        # npc lowered in the key -- same sentence-position casing variance
+        # as elsewhere (a no-article NPC's name can be capitalized or not
+        # depending on where in the sentence it landed), so two otherwise-
+        # identical lines shouldn't dodge dedup just because of that.
+        key = (r["character_name"], r["kind"], (r["npc"] or "").lower(), r["zone"], r["text"], r["amount"])
         if key in seen:
             continue
         seen.add(key)
@@ -736,15 +740,21 @@ def _compute_dialogue(game, character="", npc="", zone="", exclude_chatter=False
         # setup. "say" rows have no npc attribution in this data model (the
         # log doesn't say who you were replying to) and so never qualify on
         # their own, same as npc_detail's existing npc-filtered view.
+        # Grouped case-insensitively -- e.g. a no-article NPC's reward line
+        # (npc from a mid-sentence target, naturally lowercase) and its own
+        # dialogue line (npc from source_name, always sentence-initial so
+        # always capitalized) are the same real NPC but different raw
+        # casing; without this, one could qualify the NPC into quest_npcs
+        # while the other silently fails the membership check below.
         quest_npcs = {
-            r["npc"] for r in rows
+            r["npc"].lower() for r in rows
             if r["npc"] and (
                 r["kind"] in ("reward", "item_offer", "trade_complete")
                 or (r["kind"] == "npc_dialogue" and r["text"] and "[" in r["text"])
             )
             and not _is_chatter_excluded_npc(r["npc"])
         }
-        rows = [r for r in rows if r["npc"] in quest_npcs]
+        rows = [r for r in rows if r["npc"] and r["npc"].lower() in quest_npcs]
 
     # A reward whose text doesn't read as a currency amount is (once bare
     # item-reward parsing exists -- see h_npc_reward's known gaps) an item
@@ -1095,6 +1105,15 @@ GATE_EXCLUSION_WINDOW_S = 60  # see plan notes: real gate/origin casts land the
 # observed in the data is clearly an unrelated later zone change, not caused
 # by that cast.
 
+# Classic EQ's "Plane of Knowledge Book" -- a static, no-cast zone item found
+# in nearly every zone that teleports directly to/from PoK. Only confirmed
+# for live EQ so far (not EQL/EQ2, hence keyed by game rather than a bare
+# constant); a PoK-involved transition with no spell_cast in the preceding
+# GATE_EXCLUSION_WINDOW_S is assumed to be a book trip, per the user's own
+# framing -- there's no distinguishing log text for "clicked a book" beyond
+# that absence.
+POK_ZONE_BY_GAME = {"eq": "The Plane of Knowledge"}
+
 
 def _base_zone_expr(alias="ev"):
     # Every zone_change event already carries base_zone/tier/solo in its own
@@ -1180,14 +1199,24 @@ def _compute_zone_list(game):
                 ") t WHERE name IS NOT NULL",
                 (game, game),
             )
-            fought_names = {r["name"] for r in cur.fetchall()}
+            # Matched case-insensitively: the same mob's name can show up
+            # both capitalized ("Orc centurion") and lowercase ("orc
+            # centurion") depending on whether the client happened to
+            # capitalize it as the first word of a sentence -- same root
+            # cause as the leading-article "A"/"An" normalization in
+            # normalize_actor_name(), just without an article to anchor on,
+            # so it isn't caught there. Confirmed real in an eq log
+            # (Emperor Crush's "Orc centurion" appears both ways). rare_names
+            # is folded the same way so the same rare mob doesn't inflate
+            # rare_count by counting as two.
+            fought_names = {r["name"].lower() for r in cur.fetchall() if r["name"]}
 
             con_by_zone = {}
             for r in con_rows:
                 entry = con_by_zone.setdefault(r["zone"], {"levels": [], "rare_names": set()})
                 if r["rare"]:
-                    entry["rare_names"].add(r["npc"])
-                if r["npc"] in fought_names:
+                    entry["rare_names"].add(r["npc"].lower())
+                if r["npc"].lower() in fought_names:
                     entry["levels"].append(r["level"])
 
             cur.execute(
@@ -1306,24 +1335,12 @@ def _compute_zone_translocators(game):
     return sorted(pairs.values(), key=lambda r: (r["from_zone"] or "", r["translocator"]))
 
 
-def _compute_zone_connections(game):
-    """(from_zone, to_zone, times, last_seen) pairs derived from consecutive
-    zone_change events per character, excluding any transition where a
-    Gate/Origin cast or a translocator hail from that character landed in
-    the GATE_EXCLUSION_WINDOW_S before it -- neither is a walkable
-    connection (translocators get their own section -- see
-    _compute_zone_translocators). Both zones are base zones (tiered
-    instance variants collapse together, same as _compute_zone_list).
-
-    The gate-exclusion check used to be a correlated `NOT EXISTS` subquery in
-    SQL -- correct, but ~100x slower than this in practice: MariaDB doesn't
-    materialize the small Gate/Origin-cast CTE it's checked against, so it
-    re-scans the *whole* events table's spell_cast rows once per zone
-    transition (measured 5.67s here vs 0.06s below). Both the transition
-    list and the cast list are tiny (hundreds of rows, not hundreds of
-    thousands), so doing the exclusion check as a plain Python loop over
-    two already-fetched lists is both correct and dramatically faster.
-    """
+def _zone_transitions(game):
+    """(character_id, ts, zone, prev_zone) for every consecutive zone_change
+    pair per character where the zone actually changed. Shared by
+    _compute_zone_connections and _pok_book_routes -- both need "what
+    zone did this transition go from/to", just with different exclusion
+    rules layered on top."""
     conn = db.get_connection()
     try:
         with conn.cursor() as cur:
@@ -1339,8 +1356,98 @@ def _compute_zone_connections(game):
                 "WHERE prev_zone IS NOT NULL AND prev_zone <> zone",
                 (game,),
             )
-            transitions = cur.fetchall()
+            return cur.fetchall()
+    finally:
+        conn.close()
 
+
+def _pok_book_routes(game):
+    """Raw (character_id, ts, from_zone, to_zone) transitions classified as a
+    PoK Book trip: either side of the transition is POK_ZONE_BY_GAME[game]
+    and this character cast no spell at all in the GATE_EXCLUSION_WINDOW_S
+    before it (a real Gate/Origin/translocator trip would show a cast or a
+    translocator hail -- see _compute_zone_connections -- so absence of any
+    cast is what's left to mean "clicked a book"). Empty for any game not in
+    POK_ZONE_BY_GAME."""
+    pok_zone = POK_ZONE_BY_GAME.get(game)
+    if not pok_zone:
+        return []
+
+    transitions = [
+        tr for tr in _zone_transitions(game)
+        if tr["zone"] == pok_zone or tr["prev_zone"] == pok_zone
+    ]
+    if not transitions:
+        return []
+
+    conn = db.get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT ev.character_id, ev.ts FROM events ev JOIN games g ON ev.game_id=g.id "
+                "WHERE ev.event_type='spell_cast' AND ev.source_type='you' AND g.code=%s",
+                (game,),
+            )
+            casts = cur.fetchall()
+    finally:
+        conn.close()
+
+    casts_by_char = {}
+    for c in casts:
+        casts_by_char.setdefault(c["character_id"], []).append(c["ts"])
+
+    routes = []
+    for tr in transitions:
+        char_casts = casts_by_char.get(tr["character_id"], [])
+        cast_nearby = any(
+            0 <= (tr["ts"] - cast_ts).total_seconds() <= GATE_EXCLUSION_WINDOW_S
+            for cast_ts in char_casts
+        )
+        if cast_nearby:
+            continue
+        routes.append({
+            "character_id": tr["character_id"], "ts": tr["ts"],
+            "from_zone": tr["prev_zone"], "to_zone": tr["zone"],
+        })
+    return routes
+
+
+def _compute_pok_books(game):
+    """(from_zone, to_zone, times, last_seen) pairs aggregated from
+    _pok_book_routes, same shape/role as _compute_zone_translocators."""
+    pairs = {}
+    for r in _pok_book_routes(game):
+        key = (r["from_zone"], r["to_zone"])
+        entry = pairs.setdefault(key, {"from_zone": key[0], "to_zone": key[1], "times": 0, "last_seen": r["ts"]})
+        entry["times"] += 1
+        entry["last_seen"] = max(entry["last_seen"], r["ts"])
+    return sorted(pairs.values(), key=lambda r: (r["from_zone"] or "", r["to_zone"] or ""))
+
+
+def _compute_zone_connections(game):
+    """(from_zone, to_zone, times, last_seen) pairs derived from consecutive
+    zone_change events per character, excluding any transition where a
+    Gate/Origin cast, a translocator hail, or a PoK Book trip from that
+    character landed in the GATE_EXCLUSION_WINDOW_S before it -- none of
+    those are a walkable connection (translocators and PoK Books each get
+    their own section -- see _compute_zone_translocators/_compute_pok_books).
+    Both zones are base zones (tiered instance variants collapse together,
+    same as _compute_zone_list).
+
+    The gate-exclusion check used to be a correlated `NOT EXISTS` subquery in
+    SQL -- correct, but ~100x slower than this in practice: MariaDB doesn't
+    materialize the small Gate/Origin-cast CTE it's checked against, so it
+    re-scans the *whole* events table's spell_cast rows once per zone
+    transition (measured 5.67s here vs 0.06s below). Both the transition
+    list and the cast list are tiny (hundreds of rows, not hundreds of
+    thousands), so doing the exclusion check as a plain Python loop over
+    two already-fetched lists is both correct and dramatically faster.
+    """
+    transitions = _zone_transitions(game)
+
+    conn = db.get_connection()
+    try:
+        with conn.cursor() as cur:
             cur.execute(
                 "SELECT ev.character_id, ev.ts FROM events ev JOIN games g ON ev.game_id=g.id "
                 "WHERE ev.event_type='spell_cast' AND ev.source_type='you' AND ev.verb IN (%s,%s) AND g.code=%s",
@@ -1355,10 +1462,13 @@ def _compute_zone_connections(game):
         gate_by_char.setdefault(gc["character_id"], []).append(gc["ts"])
 
     translocated_zone_ts = {(r["character_id"], r["zone_ts"]) for r in _translocator_routes(game)}
+    book_zone_ts = {(r["character_id"], r["ts"]) for r in _pok_book_routes(game)}
 
     pairs = {}
     for tr in transitions:
         if (tr["character_id"], tr["ts"]) in translocated_zone_ts:
+            continue
+        if (tr["character_id"], tr["ts"]) in book_zone_ts:
             continue
         char_casts = gate_by_char.get(tr["character_id"], [])
         gated = any(
@@ -1471,13 +1581,18 @@ def _compute_zone_detail(game, zone, tier="all", solo="any"):
             # rare mobs seen here, cross-referenced with their own drops
             # (from the loot rows already fetched above) per the user's
             # explicit ask to be able to check a rare's drops at a glance.
+            # Matched case-insensitively -- same sentence-position
+            # capitalization issue as _compute_zone_list's fought_names
+            # (e.g. "Orc centurion" vs "orc centurion"), so npcs/loot rows
+            # for the same real mob don't fail to cross-reference just
+            # because they came from lines with different casing.
             rare_names = {n["npc"] for n in npcs if n["rare"]}
             rares = []
             for name in sorted(rare_names):
                 rares.append({
                     "npc": name,
-                    "level": next((n["level"] for n in npcs if n["npc"] == name), None),
-                    "drops": [l for l in loot if l["npc"] == name],
+                    "level": next((n["level"] for n in npcs if n["npc"].lower() == name.lower()), None),
+                    "drops": [l for l in loot if l["npc"].lower() == name.lower()],
                 })
 
             cur.execute(
@@ -1528,12 +1643,14 @@ def _render_zoneinfo_detail(request, game, game_label, zone, tier, solo):
     detail = _compute_zone_detail(game, zone, tier, solo)
     connections = _compute_zone_connections(game)
     translocators = _compute_zone_translocators(game)
+    books = _compute_pok_books(game)
     return templates.TemplateResponse(request, "zoneinfo_detail.html", {
         "game": game, "game_label": game_label, "zone": zone,
         "tier": tier, "solo": solo,
         "in_from": [c for c in connections if c["to_zone"] == zone],
         "out_to": [c for c in connections if c["from_zone"] == zone],
         "translocators_here": [t for t in translocators if t["from_zone"] == zone],
+        "books_here": [b for b in books if b["from_zone"] == zone or b["to_zone"] == zone],
         **detail,
     })
 
@@ -1627,12 +1744,18 @@ def _compute_npc_list(game, search="", zone=""):
             if names:
                 fmt = ",".join(["%s"] * len(names))
                 cur.execute(f"SELECT npc, npc_type, note FROM npc_info WHERE npc IN ({fmt})", names)
-                overrides = {r["npc"]: r for r in cur.fetchall()}
+                # Matched case-insensitively -- npc_info.npc was saved via
+                # whatever casing a different query's GROUP BY happened to
+                # pick as that NPC's representative row at the time (e.g.
+                # from /npcs/{game}/detail, a separate query from this
+                # list), which can differ from this query's own pick for
+                # the exact same real NPC.
+                overrides = {r["npc"].lower(): r for r in cur.fetchall()}
     finally:
         conn.close()
 
     for r in rows:
-        override = overrides.get(r["npc"])
+        override = overrides.get(r["npc"].lower())
         r["suggested_type"] = _suggest_npc_type(r["npc"], r)
         r["npc_type"] = (override["npc_type"] if override and override["npc_type"] else r["suggested_type"])
         r["note"] = override["note"] if override else None
@@ -2343,15 +2466,31 @@ def _compute_encounter_combat_breakdown(character, start_ts, stop_ts):
     finally:
         conn.close()
 
+    # Matched/grouped case-insensitively throughout this function: the same
+    # mob's name can appear both sentence-initial-capitalized ("Orc
+    # centurion hits YOU...") and mid-sentence-lowercase ("You pierce orc
+    # centurion...") -- confirmed real. normalize_actor_name() at ingest
+    # only catches this for the "A"/"An" leading-article case; a no-article
+    # name like this one isn't caught there (nothing to anchor the regex
+    # on), so without this it wouldn't just cosmetically split into two
+    # breakdown blocks -- an unconfirmed casing could fail the is_mob()
+    # check entirely and get silently dropped as "neither side reads as a
+    # mob". npc_display picks one casing per real mob (whichever is seen
+    # first) so buckets/npc_totals below stay keyed consistently.
     confirmed_mobs = set()
     for ev in rows:
         if ev["source_type"] == "you" and ev["target_name"]:
-            confirmed_mobs.add(ev["target_name"])
+            confirmed_mobs.add(ev["target_name"].lower())
         elif ev["target_type"] == "you" and ev["source_name"]:
-            confirmed_mobs.add(ev["source_name"])
+            confirmed_mobs.add(ev["source_name"].lower())
 
     def is_mob(actor_type, name):
-        return bool(name) and (actor_type == "npc" or name in confirmed_mobs)
+        return bool(name) and (actor_type == "npc" or name.lower() in confirmed_mobs)
+
+    npc_display: dict[str, str] = {}
+
+    def canonical_npc(name):
+        return npc_display.setdefault(name.lower(), name)
 
     buckets: dict[tuple, dict] = {}
 
@@ -2382,12 +2521,12 @@ def _compute_encounter_combat_breakdown(character, start_ts, stop_ts):
         is_melee = ev["event_type"] == "melee"
         if t_is_mob and not s_is_mob:
             combatant = "You" if s_type == "you" else s_name
-            npc, direction = t_name, "out"
+            npc, direction = canonical_npc(t_name), "out"
             nt = npc_total(npc)
             nt["melee_to" if is_melee else "spell_to"] += amount
         elif s_is_mob and not t_is_mob:
             combatant = "You" if t_type == "you" else t_name
-            npc, direction = s_name, "in"
+            npc, direction = canonical_npc(s_name), "in"
             nt = npc_total(npc)
             nt["melee_from" if is_melee else "spell_from"] += amount
         else:
