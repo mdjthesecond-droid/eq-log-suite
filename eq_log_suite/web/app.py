@@ -531,6 +531,63 @@ def _compute_quests(game, character="", quest="", zone="", npc=""):
         conn.close()
 
 
+def _correlate_task_updates(game, character=""):
+    # task_updated (see parsers/eq.py) fires with no detail of its own, but
+    # confirmed real (eqlog_Cheerfulish_povar.txt, checked line-by-line):
+    # every task_updated shares its exact (second-resolution) ts with either
+    # a "You have slain <mob>!" (event_type death, source_name "You") or a
+    # "--You have looted ...--" (event_type loot) line for that same
+    # character -- never both being wrong, but sometimes more than one
+    # candidate ties on ts (a burst of kills/loots in the same second), so
+    # line_no proximity breaks the tie. Deliberately NOT correlating by
+    # "nearest in time" across seconds -- confirmed real that some
+    # task_updated lines (assignment-adjacent, or other non-kill/loot
+    # triggers like hailing an NPC) have no same-second kill/loot at all, and
+    # guessing a distant one would be worse than leaving it unmatched.
+    inner_clauses, inner_params = ["g.code = %s"], [game]
+    if character:
+        inner_clauses.append("c.name = %s"); inner_params.append(character)
+    inner_where = f"AND {' AND '.join(inner_clauses)}"
+
+    conn = db.get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT ev.character_id, ev.target_name AS task, ev.ts, ev.line_no "
+                "FROM events ev JOIN games g ON ev.game_id=g.id JOIN characters c ON ev.character_id=c.id "
+                f"WHERE ev.event_type='task_updated' {inner_where}",
+                inner_params,
+            )
+            updates = list(cur.fetchall())
+
+            cur.execute(
+                "SELECT ev.character_id, ev.ts, ev.line_no, ev.event_type, ev.target_name, ev.amount "
+                "FROM events ev JOIN games g ON ev.game_id=g.id JOIN characters c ON ev.character_id=c.id "
+                f"WHERE (ev.event_type='loot' OR (ev.event_type='death' AND ev.source_name='You')) {inner_where}",
+                inner_params,
+            )
+            triggers = cur.fetchall()
+    finally:
+        conn.close()
+
+    triggers_by_key = {}
+    for t in triggers:
+        triggers_by_key.setdefault((t["character_id"], t["ts"]), []).append(t)
+
+    for u in updates:
+        candidates = triggers_by_key.get((u["character_id"], u["ts"]), [])
+        if not candidates:
+            u["trigger"] = None
+            continue
+        best = min(candidates, key=lambda t: abs(t["line_no"] - u["line_no"]))
+        if best["event_type"] == "death":
+            u["trigger"] = f'slain {best["target_name"]}'
+        else:
+            qty = best["amount"] or 1
+            u["trigger"] = f'looted {best["target_name"]}' if qty == 1 else f'looted {qty} {best["target_name"]}'
+    return updates
+
+
 def _compute_tasks(game, character="", task="", npc="", zone=""):
     # Live EQ's structured "Tasks" system (task_assigned/task_reward, see
     # parsers/eq.py) -- distinct from /quests/{game}'s dialogue transcript.
@@ -562,8 +619,8 @@ def _compute_tasks(game, character="", task="", npc="", zone=""):
 
     sql = (
         "SELECT * FROM ("
-        "  SELECT ev.ts AS assigned_at, c.name AS character_name, ev.target_name AS task, "
-        f"    {_ZONE_LOOKUP_EXPR} AS zone, "
+        "  SELECT ev.character_id AS character_id, ev.ts AS assigned_at, c.name AS character_name, "
+        f"    ev.target_name AS task, {_ZONE_LOOKUP_EXPR} AS zone, "
         "    (SELECT nd.source_name FROM events nd WHERE nd.event_type='npc_dialogue' "
         "       AND nd.character_id=ev.character_id AND nd.ts<=ev.ts ORDER BY nd.ts DESC LIMIT 1) AS npc, "
         "    (SELECT r.ts FROM events r WHERE r.event_type='task_reward' "
@@ -579,9 +636,49 @@ def _compute_tasks(game, character="", task="", npc="", zone=""):
     try:
         with conn.cursor() as cur:
             cur.execute(sql, inner_params + outer_params)
-            return cur.fetchall()
+            rows = list(cur.fetchall())
+
+            # Window boundaries for attaching updates to the right assignment
+            # (a task name can be assigned more than once over a character's
+            # lifetime -- dailies, or a sub-task reused across an arc) come
+            # from EVERY assignment of that character+task, not just the
+            # ones surviving the outer task/npc/zone filter above, or a
+            # narrow npc/zone search could cut a window short and misattach
+            # an update to the wrong assignment.
+            cur.execute(
+                "SELECT ev.character_id, ev.target_name AS task, ev.ts AS assigned_at "
+                "FROM events ev JOIN games g ON ev.game_id=g.id JOIN characters c ON ev.character_id=c.id "
+                f"WHERE ev.event_type='task_assigned' {inner_where}",
+                inner_params,
+            )
+            all_assignments = cur.fetchall()
     finally:
         conn.close()
+
+    windows = {}  # (character_id, task) -> sorted list of assigned_at
+    for a in all_assignments:
+        windows.setdefault((a["character_id"], a["task"]), []).append(a["assigned_at"])
+    for lst in windows.values():
+        lst.sort()
+
+    updates = _correlate_task_updates(game, character)
+    updates_by_key = {}
+    for u in updates:
+        updates_by_key.setdefault((u["character_id"], u["task"]), []).append(u)
+    for lst in updates_by_key.values():
+        lst.sort(key=lambda u: u["ts"])
+
+    for r in rows:
+        key = (r["character_id"], r["task"])
+        same_task_starts = windows.get(key, [r["assigned_at"]])
+        later_starts = [ts for ts in same_task_starts if ts > r["assigned_at"]]
+        window_end = min(later_starts) if later_starts else None
+        r["updates"] = [
+            u for u in updates_by_key.get(key, [])
+            if r["assigned_at"] <= u["ts"] and (window_end is None or u["ts"] < window_end)
+        ]
+
+    return rows
 
 
 _CURRENCY_TEXT_RE = re.compile(r"^[\d,]+\s*(platinum|gold|silver|copper)\b", re.IGNORECASE)

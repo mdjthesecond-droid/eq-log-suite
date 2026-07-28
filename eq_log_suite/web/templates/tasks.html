@@ -9,7 +9,11 @@ names an NPC or zone, so both are correlated: zone is whatever zone_change happe
 before the assignment; npc is whichever NPC most recently spoke before it (best-effort -- not a
 guaranteed source, just whoever was talking right before). A blank reward means no matching
 task_reward has been seen yet for that task name -- some sub-tasks grant their reward under a
-different name than they were assigned under, so a real reward can still fail to show up here.</p>
+different name than they were assigned under, so a real reward can still fail to show up here.
+"updates" expands each "task updated" ping to whatever kill or loot shared its exact timestamp
+(confirmed real: always 1-for-1, never one update per item in a stacked loot) -- an update with
+no matching kill/loot nearby means it was likely triggered by something else (hailing an NPC,
+reaching a location, etc.), not a parsing miss.</p>
 
 <form method="get" action="/tasks/{{ game }}">
   <input name="character" placeholder="character" value="{{ filters.character }}">
@@ -43,7 +47,7 @@ different name than they were assigned under, so a real reward can still fail to
 <div class="scroll-frame">
 <table class="sortable">
   <thead>
-    <tr><th>assigned</th><th>character</th><th>task</th><th>npc</th><th>zone</th><th>rewarded</th></tr>
+    <tr><th>assigned</th><th>character</th><th>task</th><th>npc</th><th>zone</th><th>rewarded</th><th>updates</th></tr>
   </thead>
   <tbody>
     {% for r in rows %}
@@ -54,6 +58,20 @@ different name than they were assigned under, so a real reward can still fail to
       <td>{{ r.npc or '' }}</td>
       <td>{{ r.zone or '' }}</td>
       <td>{{ r.reward_at or '' }}</td>
+      <td>
+        {% if r.updates %}
+        <details>
+          <summary>{{ r.updates|length }}</summary>
+          <ul style="margin:0.3rem 0 0; padding-left:1.2rem;">
+            {% for u in r.updates %}
+            <li>{{ u.ts }} -- {% if u.trigger %}{{ u.trigger }}{% else %}<span style="opacity:0.7;">(no matching kill/loot)</span>{% endif %}</li>
+            {% endfor %}
+          </ul>
+        </details>
+        {% else %}
+        0
+        {% endif %}
+      </td>
     </tr>
     {% endfor %}
   </tbody>
