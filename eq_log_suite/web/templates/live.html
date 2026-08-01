@@ -9,28 +9,58 @@
 
 <h2>Active Encounter</h2>
 <div id="active-box" style="padding:0.8rem 1rem; border:1px solid var(--border); border-radius:6px; margin-bottom:1.5rem;">
-  <div style="display:flex; gap:1.5rem; align-items:baseline; font-size:1.4rem; margin-bottom:0.6rem;">
-    <span id="active-dps" style="font-weight:700;">DPS --</span>
+  <div style="display:flex; gap:1.5rem; align-items:baseline; flex-wrap:wrap; font-size:1.4rem; margin-bottom:0.2rem;">
+    <span id="active-party-dps" style="font-weight:700;">Party DPS --</span>
+    <span id="active-dps" style="font-size:1rem;">Your DPS --</span>
     <span id="active-hit" style="font-size:1rem;">Hit --</span>
     <span id="active-crit" style="font-size:1rem;">Crit --</span>
-    <span id="active-damage" style="opacity:0.8; font-size:1rem;"></span>
     <span id="active-state" style="opacity:0.7; font-size:0.9rem;"></span>
   </div>
+  <div id="active-damage" style="opacity:0.8; font-size:0.95rem; margin-bottom:0.6rem;"></div>
+
+  <div id="active-party-wrap">
+    <h3 style="margin-bottom:0.3rem;">Party</h3>
+    <div class="scroll-frame">
+    <table id="active-party-table" class="sortable">
+      <thead>
+        <tr>
+          <th>combatant</th><th>dmg out</th><th>dps out</th><th>dmg in</th><th>dps in</th>
+          <th>hit%</th><th>crit%</th><th>their hit%</th><th>their crit%</th>
+        </tr>
+      </thead>
+      <tbody id="active-party-body"></tbody>
+    </table>
+    </div>
+  </div>
+
+  <h3 style="margin-bottom:0.3rem;">Mobs</h3>
+  <div class="scroll-frame">
   <table id="active-mobs-table" class="sortable">
     <thead>
       <tr>
-        <th>mob</th><th>dmg out</th><th>dps out</th><th>dmg in</th><th>dps in</th>
+        <th>mob</th><th>party dmg out</th><th>party dps out</th><th>party dmg in</th><th>party dps in</th>
+        <th>your dmg out</th><th>your dps out</th>
         <th>my hit%</th><th>my crit%</th><th>their hit%</th><th>their crit%</th>
+        <th>contributors (dmg out)</th>
       </tr>
     </thead>
     <tbody id="active-mobs-body"></tbody>
   </table>
+  </div>
   <p id="active-empty" style="opacity:0.7;">No combat yet this session.</p>
 </div>
 
 <h2>Previous Encounters</h2>
 <p style="opacity:0.7; font-size:0.9rem;">Last 40. For full history -- a whole day, or an
 imported log -- see <a href="/encounters">Encounters</a>.</p>
+
+<div id="merge-bar" style="display:none; position:sticky; top:0; z-index:5; padding:0.5rem 1rem;
+  border:1px solid var(--border); border-radius:6px; margin-bottom:0.6rem; background:var(--bg, #12141c);">
+  <span id="merge-count"></span>
+  <button type="button" id="merge-btn" style="margin-left:0.8rem;">Merge selected -&gt; breakdown</button>
+  <button type="button" id="merge-clear" style="margin-left:0.4rem;">Clear selection</button>
+</div>
+
 <div id="encounters-list"></div>
 
 <script>
@@ -46,15 +76,42 @@ imported log -- see <a href="/encounters">Encounters</a>.</p>
   // always arrives well before either would fire during real combat.
   const EQL_OUT_OF_COMBAT_SECONDS = 5;
   const DAMAGE_EVENT_TYPES = new Set(["melee", "spell_damage", "ability_damage"]);
-  const enc = { active: false, startTs: null, lastTs: null, damageOut: 0, damageIn: 0,
-                swings: 0, landed: 0, crits: 0, mobs: {} };
+  const enc = { active: false, startTs: null, lastTs: null,
+                damageOut: 0, damageIn: 0, swings: 0, landed: 0, crits: 0,   // your own stats
+                partyDamageOut: 0, partyDamageIn: 0,                        // whole party
+                mobs: {}, combatants: {}, confirmedMobs: new Set() };
 
   function mobRow(name) {
     if (!enc.mobs[name]) {
       enc.mobs[name] = { mob: name, damageOut: 0, damageIn: 0,
-        swings: 0, landed: 0, crits: 0, theirSwings: 0, theirLanded: 0, theirCrits: 0 };
+        swings: 0, landed: 0, crits: 0, theirSwings: 0, theirLanded: 0, theirCrits: 0,
+        partyDamageOut: 0, partyDamageIn: 0, contributors: {} };
     }
     return enc.mobs[name];
+  }
+
+  function contributorRow(row, name) {
+    if (!row.contributors[name]) row.contributors[name] = { name, damageOut: 0 };
+    return row.contributors[name];
+  }
+
+  // Per-combatant rollup across every mob this encounter -- one row per
+  // party member (or pet, once nameable) plus You, for the Party table.
+  function combatantRow(name) {
+    if (!enc.combatants[name]) {
+      enc.combatants[name] = { name, damageOut: 0, damageIn: 0,
+        swings: 0, landed: 0, crits: 0, theirSwings: 0, theirLanded: 0, theirCrits: 0 };
+    }
+    return enc.combatants[name];
+  }
+
+  // Same name-only mob classification the backend uses for third-party
+  // lines (_is_mob/confirmed_mobs in app.py): a generic article-prefixed
+  // name is always a mob; a proper-noun name only counts once your own
+  // engagement has confirmed it (otherwise a player and a unique NPC are
+  // textually identical).
+  function isMob(actorType, name) {
+    return !!name && (actorType === "npc" || enc.confirmedMobs.has(name));
   }
 
   function startEncounter(now) {
@@ -63,7 +120,10 @@ imported log -- see <a href="/encounters">Encounters</a>.</p>
     enc.lastTs = now;
     enc.damageOut = 0; enc.damageIn = 0;
     enc.swings = 0; enc.landed = 0; enc.crits = 0;
+    enc.partyDamageOut = 0; enc.partyDamageIn = 0;
     enc.mobs = {};
+    enc.combatants = {};
+    enc.confirmedMobs = new Set();
   }
 
   function stopEncounter(now) {
@@ -77,6 +137,11 @@ imported log -- see <a href="/encounters">Encounters</a>.</p>
     if (!enc.active) startEncounter(now);  // EQL: a combat action opens the encounter
     enc.lastTs = now;
 
+    if (e.source_type === "you" && e.target_name) enc.confirmedMobs.add(e.target_name);
+    if (e.target_type === "you" && e.source_name) enc.confirmedMobs.add(e.source_name);
+
+    // ---- your own perspective: trusts source/target type "you" directly,
+    // no ambiguity to resolve for your own actions.
     if (e.source_type === "you" && e.target_name) {
       const row = mobRow(e.target_name);
       if (e.amount != null) { enc.damageOut += e.amount; row.damageOut += e.amount; }
@@ -86,7 +151,6 @@ imported log -- see <a href="/encounters">Encounters</a>.</p>
         if (e.outcome === "crit") { enc.crits += 1; row.crits += 1; }
       }
     }
-    // "you" as target_type marks incoming damage regardless of who's tracked as source
     if (e.target_type === "you" && e.source_name) {
       const row = mobRow(e.source_name);
       if (e.amount != null) { enc.damageIn += e.amount; row.damageIn += e.amount; }
@@ -96,18 +160,62 @@ imported log -- see <a href="/encounters">Encounters</a>.</p>
         if (e.outcome === "crit") row.theirCrits += 1;
       }
     }
+
+    // ---- whole party: EQL logs everyone in your group/raid's combat, not
+    // just your own -- attribute damage between a mob and anyone else too
+    // (per-mob totals+contributors, and a parallel per-combatant rollup
+    // across every mob for the Party table), so the active box reflects the
+    // whole encounter, not just you. Swing counts run on every matching
+    // event (misses included, for hit%/crit% denominators), damage totals
+    // only when amount is present.
+    const sIsMob = isMob(e.source_type, e.source_name);
+    const tIsMob = isMob(e.target_type, e.target_name);
+    const isMelee = e.event_type === "melee";
+    if (tIsMob && !sIsMob && e.source_name) {
+      const mrow = mobRow(e.target_name);
+      const who = e.source_type === "you" ? "You" : e.source_name;
+      const crow = combatantRow(who);
+      if (e.amount != null) {
+        mrow.partyDamageOut += e.amount;
+        enc.partyDamageOut += e.amount;
+        contributorRow(mrow, who).damageOut += e.amount;
+        crow.damageOut += e.amount;
+      }
+      if (isMelee) {
+        crow.swings += 1;
+        if (e.outcome === "hit" || e.outcome === "crit") crow.landed += 1;
+        if (e.outcome === "crit") crow.crits += 1;
+      }
+    } else if (sIsMob && !tIsMob && e.target_name) {
+      const mrow = mobRow(e.source_name);
+      const who = e.target_type === "you" ? "You" : e.target_name;
+      const crow = combatantRow(who);
+      if (e.amount != null) {
+        mrow.partyDamageIn += e.amount;
+        enc.partyDamageIn += e.amount;
+        crow.damageIn += e.amount;
+      }
+      if (isMelee) {
+        crow.theirSwings += 1;
+        if (e.outcome === "hit" || e.outcome === "crit") crow.theirLanded += 1;
+        if (e.outcome === "crit") crow.theirCrits += 1;
+      }
+    }
   }
 
   function pct(num, den) { return den ? Math.round((num / den) * 100) : null; }
   function fmtPct(p) { return p === null ? "--" : p + "%"; }
+  function esc(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
 
   function renderActive() {
     const now = Date.now();
     const hasData = enc.startTs !== null;
     document.getElementById("active-empty").style.display = hasData ? "none" : "";
     document.getElementById("active-mobs-table").style.display = hasData ? "" : "none";
+    document.getElementById("active-party-wrap").style.display = hasData ? "" : "none";
     if (!hasData) {
-      document.getElementById("active-dps").textContent = "DPS --";
+      document.getElementById("active-party-dps").textContent = "Party DPS --";
+      document.getElementById("active-dps").textContent = "Your DPS --";
       document.getElementById("active-hit").textContent = "Hit --";
       document.getElementById("active-crit").textContent = "Crit --";
       document.getElementById("active-damage").textContent = "";
@@ -116,27 +224,56 @@ imported log -- see <a href="/encounters">Encounters</a>.</p>
     }
     const end = enc.active ? now : enc.lastTs;
     const elapsedS = Math.max((end - enc.startTs) / 1000, 0.1);
-    const dps = Math.round(enc.damageOut / elapsedS);
-    document.getElementById("active-dps").textContent = `DPS ${dps.toLocaleString()}`;
+    const partyDps = Math.round(enc.partyDamageOut / elapsedS);
+    const yourDps = Math.round(enc.damageOut / elapsedS);
+    document.getElementById("active-party-dps").textContent = `Party DPS ${partyDps.toLocaleString()}`;
+    document.getElementById("active-dps").textContent = `Your DPS ${yourDps.toLocaleString()}`;
     document.getElementById("active-hit").textContent = `Hit ${fmtPct(pct(enc.landed, enc.swings))}`;
     document.getElementById("active-crit").textContent = `Crit ${fmtPct(pct(enc.crits, enc.landed))}`;
     document.getElementById("active-damage").textContent =
-      `${enc.damageOut.toLocaleString()} out / ${enc.damageIn.toLocaleString()} in dmg -- ${elapsedS.toFixed(0)}s`;
+      `Party: ${enc.partyDamageOut.toLocaleString()} out / ${enc.partyDamageIn.toLocaleString()} in dmg -- ` +
+      `You: ${enc.damageOut.toLocaleString()} out / ${enc.damageIn.toLocaleString()} in dmg -- ${elapsedS.toFixed(0)}s`;
     document.getElementById("active-state").textContent = enc.active ? "" : "(stopped)";
     document.getElementById("active-box").style.opacity = enc.active ? "1" : "0.6";
 
     const tbody = document.getElementById("active-mobs-body");
     tbody.innerHTML = "";
-    const rows = Object.values(enc.mobs).sort((a, b) => b.damageOut - a.damageOut);
+    const rows = Object.values(enc.mobs).sort((a, b) => b.partyDamageOut - a.partyDamageOut);
     for (const r of rows) {
       const tr = document.createElement("tr");
+      const partyDpsOut = (r.partyDamageOut / elapsedS).toFixed(1);
+      const partyDpsIn = (r.partyDamageIn / elapsedS).toFixed(1);
       const dpsOut = (r.damageOut / elapsedS).toFixed(1);
-      const dpsIn = (r.damageIn / elapsedS).toFixed(1);
-      tr.innerHTML = `<td>${r.mob}</td><td>${r.damageOut.toLocaleString()}</td><td>${dpsOut}</td>` +
-        `<td>${r.damageIn.toLocaleString()}</td><td>${dpsIn}</td>` +
+      const contribText = Object.values(r.contributors)
+        .sort((a, b) => b.damageOut - a.damageOut)
+        .map(c => `${esc(c.name)}: ${c.damageOut.toLocaleString()}`).join(", ");
+      tr.innerHTML = `<td>${esc(r.mob)}</td><td>${r.partyDamageOut.toLocaleString()}</td><td>${partyDpsOut}</td>` +
+        `<td>${r.partyDamageIn.toLocaleString()}</td><td>${partyDpsIn}</td>` +
+        `<td>${r.damageOut.toLocaleString()}</td><td>${dpsOut}</td>` +
         `<td>${fmtPct(pct(r.landed, r.swings))}</td><td>${fmtPct(pct(r.crits, r.landed))}</td>` +
-        `<td>${fmtPct(pct(r.theirLanded, r.theirSwings))}</td><td>${fmtPct(pct(r.theirCrits, r.theirLanded))}</td>`;
+        `<td>${fmtPct(pct(r.theirLanded, r.theirSwings))}</td><td>${fmtPct(pct(r.theirCrits, r.theirLanded))}</td>` +
+        `<td style="font-size:0.85rem;">${contribText}</td>`;
       tbody.appendChild(tr);
+    }
+
+    const partyBody = document.getElementById("active-party-body");
+    partyBody.innerHTML = "";
+    const totalTr = document.createElement("tr");
+    totalTr.style.fontWeight = "700";
+    totalTr.innerHTML = `<td>Party total</td><td>${enc.partyDamageOut.toLocaleString()}</td><td>${partyDps.toLocaleString()}</td>` +
+      `<td>${enc.partyDamageIn.toLocaleString()}</td><td>${Math.round(enc.partyDamageIn / elapsedS).toLocaleString()}</td>` +
+      `<td></td><td></td><td></td><td></td>`;
+    partyBody.appendChild(totalTr);
+    const combatants = Object.values(enc.combatants).sort((a, b) => b.damageOut - a.damageOut);
+    for (const c of combatants) {
+      const tr = document.createElement("tr");
+      const cDpsOut = (c.damageOut / elapsedS).toFixed(1);
+      const cDpsIn = (c.damageIn / elapsedS).toFixed(1);
+      tr.innerHTML = `<td>${esc(c.name)}</td><td>${c.damageOut.toLocaleString()}</td><td>${cDpsOut}</td>` +
+        `<td>${c.damageIn.toLocaleString()}</td><td>${cDpsIn}</td>` +
+        `<td>${fmtPct(pct(c.landed, c.swings))}</td><td>${fmtPct(pct(c.crits, c.landed))}</td>` +
+        `<td>${fmtPct(pct(c.theirLanded, c.theirSwings))}</td><td>${fmtPct(pct(c.theirCrits, c.theirLanded))}</td>`;
+      partyBody.appendChild(tr);
     }
   }
 
@@ -171,6 +308,32 @@ imported log -- see <a href="/encounters">Encounters</a>.</p>
   // ---- Previous encounters: server-computed list + on-demand per-mob detail.
   const loadedDetails = new Set();
 
+  // Selected-for-merge state survives loadEncounters()'s periodic full
+  // rebuild of #encounters-list (keyed the same way as the merge/detail
+  // fetches: character|start_ts|stop_ts).
+  const selectedEncounters = new Map();
+  function encKey(character, startTs, stopTs) { return `${character}|${startTs}|${stopTs}`; }
+
+  function updateMergeBar() {
+    const n = selectedEncounters.size;
+    document.getElementById("merge-bar").style.display = n >= 2 ? "" : "none";
+    document.getElementById("merge-count").textContent = `${n} encounter(s) selected`;
+  }
+  document.getElementById("merge-btn").addEventListener("click", () => {
+    const params = new URLSearchParams();
+    for (const w of selectedEncounters.values()) {
+      params.append("character", w.character);
+      params.append("start_ts", w.start_ts);
+      params.append("stop_ts", w.stop_ts);
+    }
+    window.open(`/encounters/breakdown/merged?${params}`, "_blank");
+  });
+  document.getElementById("merge-clear").addEventListener("click", () => {
+    selectedEncounters.clear();
+    document.querySelectorAll(".enc-select").forEach((cb) => { cb.checked = false; });
+    updateMergeBar();
+  });
+
   function fmtTs(iso) {
     return iso.replace("T", " ");
   }
@@ -183,15 +346,38 @@ imported log -- see <a href="/encounters">Encounters</a>.</p>
     for (const e of encounters) {
       if (e.active) continue;  // shown in the Active Encounter box instead
       const details = document.createElement("details");
-      const key = `${e.character}|${e.start_ts}|${e.stop_ts}`;
+      const key = encKey(e.character, e.start_ts, e.stop_ts);
       const summary = document.createElement("summary");
+
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.className = "enc-select";
+      checkbox.title = "select to merge with other encounters";
+      checkbox.checked = selectedEncounters.has(key);
+      checkbox.addEventListener("click", (ev) => ev.stopPropagation());
+      checkbox.addEventListener("change", () => {
+        if (checkbox.checked) {
+          selectedEncounters.set(key, { character: e.character, start_ts: e.start_ts, stop_ts: e.stop_ts });
+        } else {
+          selectedEncounters.delete(key);
+        }
+        updateMergeBar();
+      });
+      summary.appendChild(checkbox);
+
       const mobLabel = e.first_mob
         ? e.first_mob + (e.mob_count > 1 ? ` (+${e.mob_count - 1} more, ${e.mob_count} mobs total)` : "")
         : "(no mob interaction)";
-      summary.textContent =
-        `${mobLabel} -- ${e.duration_s}s -- ${fmtTs(e.start_ts)} | ${e.character} | ` +
+      const healText = (e.healing_out || e.healing_in)
+        ? ` | Heal ${Math.round(e.healing_out)}${e.overheal_out ? ` (${Math.round(e.overheal_out)} overheal)` : ""} out / ` +
+          `${Math.round(e.healing_in)}${e.overheal_in ? ` (${Math.round(e.overheal_in)} overheal)` : ""} in`
+        : "";
+      const text = document.createTextNode(
+        ` ${mobLabel} -- ${e.duration_s}s -- ${fmtTs(e.start_ts)} | ${e.character} | ` +
         `DPS ${e.dps_out} | ${Math.round(e.damage_out)} out / ${Math.round(e.damage_in)} in dmg | ` +
-        `Hit ${fmtPct(e.hit_pct)} Crit ${fmtPct(e.crit_pct)} | ${e.kills} kill(s)`;
+        `Hit ${fmtPct(e.hit_pct)} Crit ${fmtPct(e.crit_pct)} | ${e.kills} kill(s)${healText}`
+      );
+      summary.appendChild(text);
       details.appendChild(summary);
       const body = document.createElement("div");
       body.style.padding = "0.5rem 0 0.5rem 1rem";
@@ -203,22 +389,36 @@ imported log -- see <a href="/encounters">Encounters</a>.</p>
         const params = new URLSearchParams({ character: e.character, start_ts: e.start_ts, stop_ts: e.stop_ts });
         const detailRes = await fetch(`/api/encounters/detail?${params}`);
         const mobs = await detailRes.json();
+
+        body.innerHTML = "";
+
+        const breakdownLink = document.createElement("a");
+        breakdownLink.href = `/encounters/breakdown?${params}`;
+        breakdownLink.target = "_blank";
+        breakdownLink.textContent = "full breakdown ↗";
+        breakdownLink.style.cssText = "display:inline-block; margin-bottom:0.4rem;";
+        body.appendChild(breakdownLink);
+
         if (!mobs.length) {
-          body.textContent = "No per-mob data.";
+          const p = document.createElement("p");
+          p.textContent = "No per-mob data.";
+          body.appendChild(p);
           return;
         }
         const table = document.createElement("table");
         table.innerHTML = "<thead><tr><th>mob</th><th>dmg out</th><th>dmg in</th>" +
           "<th>my hit%</th><th>my crit%</th><th>their hit%</th><th>their crit%</th>" +
-          "<th>my evasion%</th><th>their resist%</th><th>my DS dmg</th><th>their DS dmg</th></tr></thead>" +
-          "<tbody>" + mobs.map(m =>
-            `<tr><td>${m.mob}</td><td>${m.damage_out.toLocaleString()}</td><td>${m.damage_in.toLocaleString()}</td>` +
-            `<td>${fmtPct(m.hit_pct)}</td><td>${fmtPct(m.crit_pct)}</td>` +
-            `<td>${fmtPct(m.their_hit_pct)}</td><td>${fmtPct(m.their_crit_pct)}</td>` +
-            `<td>${fmtPct(m.evasion_pct)}</td><td>${fmtPct(m.resist_pct)}</td>` +
-            `<td>${m.ds_out.toLocaleString()}</td><td>${m.ds_in.toLocaleString()}</td></tr>`
-          ).join("") + "</tbody>";
-        body.innerHTML = "";
+          "<th>my evasion%</th><th>their resist%</th><th>my DS dmg</th><th>their DS dmg</th>" +
+          "<th>contributors (dmg out)</th></tr></thead><tbody>" + mobs.map(m => {
+            const contribText = (m.contributors || [])
+              .map(c => `${esc(c.name)}: ${c.damage_out.toLocaleString()}`).join(", ");
+            return `<tr><td>${esc(m.mob)}</td><td>${m.damage_out.toLocaleString()}</td><td>${m.damage_in.toLocaleString()}</td>` +
+              `<td>${fmtPct(m.hit_pct)}</td><td>${fmtPct(m.crit_pct)}</td>` +
+              `<td>${fmtPct(m.their_hit_pct)}</td><td>${fmtPct(m.their_crit_pct)}</td>` +
+              `<td>${fmtPct(m.evasion_pct)}</td><td>${fmtPct(m.resist_pct)}</td>` +
+              `<td>${m.ds_out.toLocaleString()}</td><td>${m.ds_in.toLocaleString()}</td>` +
+              `<td style="font-size:0.85rem;">${contribText}</td></tr>`;
+          }).join("") + "</tbody>";
         body.appendChild(table);
       });
       container.appendChild(details);

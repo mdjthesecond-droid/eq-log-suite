@@ -157,11 +157,12 @@ def _heal_extra(m):
 
 
 def h_heal(m):
+    outcome = "crit" if m.group("tag") == "Critical" else "hit"
     return ParsedEvent(
         ts=None, raw_line=None, event_type="spell_heal",
         source_name="You", source_type="you",
         target_name=m.group("target"), target_type="unknown",
-        verb=m.group("spell"), amount=_amount(m), outcome="hit",
+        verb=m.group("spell"), amount=_amount(m), outcome=outcome,
         extra=_heal_extra(m),
     )
 
@@ -169,11 +170,12 @@ def h_heal(m):
 def h_heal_other(m):
     source = m.group("source")
     target = m.group("target")
+    outcome = "crit" if m.group("tag") == "Critical" else "hit"
     return ParsedEvent(
         ts=None, raw_line=None, event_type="spell_heal",
         source_name=source, source_type=GameParser.classify_actor(source),
         target_name=target, target_type=GameParser.classify_actor(target),
-        verb=m.group("spell"), amount=_amount(m), outcome="hit",
+        verb=m.group("spell"), amount=_amount(m), outcome=outcome,
         extra=_heal_extra(m),
     )
 
@@ -696,15 +698,21 @@ class EQLegendsParser(GameParser):
 
         # "You healed Cheerful for 349 hit points by Greater Healing."
         # "You healed Cheerful for 5 (10) hit points by Blood Siphon Strike."
+        # HoT ticks insert " over time" before "for" (e.g. "You healed
+        # Cheerful over time for 11 (61) hit points by Flowering Heal.") and
+        # any heal can carry a trailing " (Critical)" tag, same convention
+        # as melee's (Critical)/(Riposte) suffix -- both confirmed real
+        # (eqlog_Cheerful_rivervale.txt: "Eagle healed himself over time for
+        # 102 (122) hit points by Flowering Heal. (Critical)").
         (re.compile(
-            r"^You healed (?P<target>.+?) for (?P<amount>\d+)(?: \((?P<potential>\d+)\))? "
-            r"hit points? by (?P<spell>.+?)\.$"
+            r"^You healed (?P<target>.+?)(?: over time)? for (?P<amount>\d+)(?: \((?P<potential>\d+)\))? "
+            r"hit points? by (?P<spell>.+?)\.(?: \((?P<tag>Critical)\))?$"
         ), h_heal),
 
         # "Auraline healed Cheerful for 108 (457) hit points by Spirit Salve."
         (re.compile(
-            r"^(?P<source>.+?) healed (?P<target>.+?) for (?P<amount>\d+)(?: \((?P<potential>\d+)\))? "
-            r"hit points? by (?P<spell>.+?)\.$"
+            r"^(?P<source>.+?) healed (?P<target>.+?)(?: over time)? for (?P<amount>\d+)(?: \((?P<potential>\d+)\))? "
+            r"hit points? by (?P<spell>.+?)\.(?: \((?P<tag>Critical)\))?$"
         ), h_heal_other),
 
         # "A grikbar kobold has taken 10 damage from your Blood Siphon Strike."

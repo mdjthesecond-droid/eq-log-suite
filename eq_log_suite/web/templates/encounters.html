@@ -49,6 +49,7 @@ a few weeks of history.</p>
   <input name="character" placeholder="character (required)" value="{{ filters.character }}" required>
   <input name="start_ts" type="datetime-local" title="start (required)" value="{{ filters.start_ts }}" required>
   <input name="end_ts" type="datetime-local" title="end (required)" value="{{ filters.end_ts }}" required>
+  <input name="npc" placeholder="npc name (optional, e.g. Vox)" value="{{ filters.npc }}">
   <input name="limit" type="number" min="0" max="5000" title="max results (0 = unlimited)" value="{{ filters.limit }}" style="width:90px;">
   <select name="order">
     <option value="desc" {% if filters.order == 'desc' %}selected{% endif %}>newest first</option>
@@ -62,7 +63,8 @@ a few weeks of history.</p>
 {% else %}
 <p style="opacity:0.8;">
   {{ totals.count }} encounter(s) -- {{ totals.damage_out|round|int }} dmg out /
-  {{ totals.damage_in|round|int }} dmg in -- {{ totals.kills }} kill(s) --
+  {{ totals.damage_in|round|int }} dmg in -- {{ totals.healing_out|round|int }} heal out /
+  {{ totals.healing_in|round|int }} heal in -- {{ totals.kills }} kill(s) --
   {{ (totals.duration_s / 60)|round(1) }} min total in combat
 </p>
 {% if not encounters %}
@@ -70,10 +72,20 @@ a few weeks of history.</p>
 {% endif %}
 {% endif %}
 
+<div id="merge-bar" style="display:none; position:sticky; top:0; z-index:5; padding:0.5rem 1rem;
+  border:1px solid var(--border); border-radius:6px; margin-bottom:0.6rem; background:var(--bg, #12141c);">
+  <span id="merge-count"></span>
+  <button type="button" id="merge-btn" style="margin-left:0.8rem;">Merge selected -&gt; breakdown</button>
+  <button type="button" id="merge-clear" style="margin-left:0.4rem;">Clear selection</button>
+</div>
+
 <div id="encounters-list">
   {% for e in encounters %}
   <details class="encounter-row" data-character="{{ e.character }}" data-start-ts="{{ e.start_ts }}" data-stop-ts="{{ e.stop_ts or '' }}">
     <summary>
+      <input type="checkbox" class="enc-select" data-character="{{ e.character }}"
+        data-start-ts="{{ e.start_ts }}" data-stop-ts="{{ e.stop_ts or '' }}"
+        onclick="event.stopPropagation()" title="select to merge with other encounters">
       <strong>
         {%- if e.first_mob -%}
           {{ e.first_mob }}{% if e.mob_count > 1 %} (+{{ e.mob_count - 1 }} more, {{ e.mob_count }} mobs total){% endif %}
@@ -87,6 +99,10 @@ a few weeks of history.</p>
       Hit {{ (e.hit_pct ~ '%') if e.hit_pct is not none else '--' }}
       Crit {{ (e.crit_pct ~ '%') if e.crit_pct is not none else '--' }} |
       {{ e.kills }} kill(s)
+      {%- if e.healing_out or e.healing_in %} |
+      Heal {{ e.healing_out|round|int }}{% if e.overheal_out %} ({{ e.overheal_out|round|int }} overheal){% endif %} out /
+      {{ e.healing_in|round|int }}{% if e.overheal_in %} ({{ e.overheal_in|round|int }} overheal){% endif %} in
+      {%- endif %}
     </summary>
     <div class="encounter-detail" style="padding:0.5rem 0 0.5rem 1rem;">Loading...</div>
   </details>
@@ -213,6 +229,43 @@ a few weeks of history.</p>
 
       body.appendChild(table);
     });
+  });
+
+  // ---- Multi-select + merge: pick several encounters (e.g. a string of
+  // trash pulls, or repeated attempts on the same boss) and open a combined
+  // breakdown that sums them into one set of totals instead of viewing each
+  // separately.
+  const selectedEncounters = new Map();
+  function encSelectKey(cb) { return `${cb.dataset.character}|${cb.dataset.startTs}|${cb.dataset.stopTs}`; }
+  function updateMergeBar() {
+    const n = selectedEncounters.size;
+    document.getElementById("merge-bar").style.display = n >= 2 ? "" : "none";
+    document.getElementById("merge-count").textContent = `${n} encounter(s) selected`;
+  }
+  document.querySelectorAll(".enc-select").forEach((cb) => {
+    cb.addEventListener("change", () => {
+      const key = encSelectKey(cb);
+      if (cb.checked) {
+        selectedEncounters.set(key, { character: cb.dataset.character, start_ts: cb.dataset.startTs, stop_ts: cb.dataset.stopTs });
+      } else {
+        selectedEncounters.delete(key);
+      }
+      updateMergeBar();
+    });
+  });
+  document.getElementById("merge-btn").addEventListener("click", () => {
+    const params = new URLSearchParams();
+    for (const w of selectedEncounters.values()) {
+      params.append("character", w.character);
+      params.append("start_ts", w.start_ts);
+      params.append("stop_ts", w.stop_ts);
+    }
+    window.open(`/encounters/breakdown/merged?${params}`, "_blank");
+  });
+  document.getElementById("merge-clear").addEventListener("click", () => {
+    selectedEncounters.clear();
+    document.querySelectorAll(".enc-select").forEach((cb) => { cb.checked = false; });
+    updateMergeBar();
   });
 </script>
 {% endblock %}

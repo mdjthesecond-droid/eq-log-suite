@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
-from fastapi import FastAPI, Form, Request
+from fastapi import FastAPI, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -2304,7 +2304,7 @@ def _derive_gap_based_encounters(rows, gap_seconds):
     return finished
 
 
-def _compute_encounters(character="", start_ts="", end_ts="", limit=30, ascending=False):
+def _compute_encounters(character="", start_ts="", end_ts="", npc="", limit=30, ascending=False):
     clauses, params = [], []
     if character:
         clauses.append("c.name = %s"); params.append(character)
@@ -2350,7 +2350,39 @@ def _compute_encounters(character="", start_ts="", end_ts="", limit=30, ascendin
             )
             activity = cur.fetchall()
 
+            # NPC filter: which (character_id, ts) combat events touched a
+            # name matching the search, bulk-fetched once and checked with a
+            # binary search (bisect) per encounter window below -- same
+            # "fetch once, check in Python" reasoning as the zone-lookup
+            # helpers elsewhere in this file, and avoids a correlated
+            # subquery per encounter. Applied before the sort+limit slice so
+            # e.g. "just Vox today" isn't silently truncated by unrelated
+            # encounters eating the limit first.
+            npc_hits: dict[int, list] = {}
+            if npc:
+                cur.execute(
+                    "SELECT ev.character_id, ev.ts "
+                    "FROM events ev JOIN characters c ON ev.character_id=c.id "
+                    f"WHERE ev.event_type IN {DAMAGE_EVENT_TYPES_SQL} "
+                    "AND (ev.source_name LIKE %s OR ev.target_name LIKE %s) "
+                    f"{where} ORDER BY ev.ts",
+                    [f"%{npc}%", f"%{npc}%"] + params,
+                )
+                for row in cur.fetchall():
+                    npc_hits.setdefault(row["character_id"], []).append(row["ts"])
+
         encounters = _merge_encounters(markers) + _derive_gap_based_encounters(activity, EQL_OUT_OF_COMBAT_SECONDS)
+
+        if npc:
+            def _touches_npc(e):
+                hits = npc_hits.get(e["character_id"])
+                if not hits:
+                    return False
+                end = e["stop_ts"] or datetime.now()
+                idx = bisect.bisect_left(hits, e["start_ts"])
+                return idx < len(hits) and hits[idx] <= end
+            encounters = [e for e in encounters if _touches_npc(e)]
+
         encounters.sort(key=lambda e: e["start_ts"], reverse=not ascending)
         if limit:
             encounters = encounters[:limit]
@@ -2375,6 +2407,10 @@ def _compute_encounters(character="", start_ts="", end_ts="", limit=30, ascendin
                     f"SELECT "
                     f"  SUM(CASE WHEN source_type='you' AND event_type IN {DAMAGE_EVENT_TYPES_SQL} THEN amount ELSE 0 END) AS damage_out, "
                     f"  SUM(CASE WHEN target_type='you' AND event_type IN {DAMAGE_EVENT_TYPES_SQL} THEN amount ELSE 0 END) AS damage_in, "
+                    f"  SUM(CASE WHEN source_type='you' AND event_type='spell_heal' THEN amount ELSE 0 END) AS healing_out, "
+                    f"  SUM(CASE WHEN target_type='you' AND event_type='spell_heal' THEN amount ELSE 0 END) AS healing_in, "
+                    f"  SUM(CASE WHEN source_type='you' AND event_type='spell_heal' THEN CAST(JSON_EXTRACT(extra,'$.overheal') AS UNSIGNED) ELSE 0 END) AS overheal_out, "
+                    f"  SUM(CASE WHEN target_type='you' AND event_type='spell_heal' THEN CAST(JSON_EXTRACT(extra,'$.overheal') AS UNSIGNED) ELSE 0 END) AS overheal_in, "
                     f"  SUM(CASE WHEN source_type='you' AND event_type='melee' THEN 1 ELSE 0 END) AS swings, "
                     f"  SUM(CASE WHEN source_type='you' AND event_type='melee' AND outcome IN ('hit','crit') THEN 1 ELSE 0 END) AS landed, "
                     f"  SUM(CASE WHEN source_type='you' AND event_type='melee' AND outcome='crit' THEN 1 ELSE 0 END) AS crits, "
@@ -2429,6 +2465,10 @@ def _compute_encounters(character="", start_ts="", end_ts="", limit=30, ascendin
 
             damage_out = float(s["damage_out"] or 0)
             damage_in = float(s["damage_in"] or 0)
+            healing_out = float(s["healing_out"] or 0)
+            healing_in = float(s["healing_in"] or 0)
+            overheal_out = float(s["overheal_out"] or 0)
+            overheal_in = float(s["overheal_in"] or 0)
             swings = int(s["swings"] or 0)
             landed = int(s["landed"] or 0)
             crits = int(s["crits"] or 0)
@@ -2444,6 +2484,10 @@ def _compute_encounters(character="", start_ts="", end_ts="", limit=30, ascendin
                 "damage_in": damage_in,
                 "dps_out": round(damage_out / span, 1),
                 "dps_in": round(damage_in / span, 1),
+                "healing_out": healing_out,
+                "healing_in": healing_in,
+                "overheal_out": overheal_out,
+                "overheal_in": overheal_in,
                 "hit_pct": round(landed / swings * 100, 1) if swings else None,
                 "crit_pct": round(crits / landed * 100, 1) if landed else None,
                 "kills": kills,
@@ -2457,8 +2501,8 @@ def _compute_encounters(character="", start_ts="", end_ts="", limit=30, ascendin
 
 
 @app.get("/api/encounters")
-def api_encounters(character: str = "", start_ts: str = "", end_ts: str = "", limit: int = 30):
-    return JSONResponse(_compute_encounters(character, start_ts, end_ts, limit))
+def api_encounters(character: str = "", start_ts: str = "", end_ts: str = "", npc: str = "", limit: int = 30):
+    return JSONResponse(_compute_encounters(character, start_ts, end_ts, npc, limit))
 
 
 def _known_logs():
@@ -2496,7 +2540,7 @@ def _known_logs():
 
 @app.get("/encounters", response_class=HTMLResponse)
 def encounters_browse(
-    request: Request, character: str = "", start_ts: str = "", end_ts: str = "",
+    request: Request, character: str = "", start_ts: str = "", end_ts: str = "", npc: str = "",
     limit: int = 200, order: str = "desc",
 ):
     limit = max(0, min(limit, 5000))
@@ -2506,13 +2550,15 @@ def encounters_browse(
     # play), so "run automatically on page load" doesn't scale.
     ready = bool(character and start_ts and end_ts)
     encounters = []
-    totals = {"count": 0, "damage_out": 0, "damage_in": 0, "kills": 0, "duration_s": 0}
+    totals = {"count": 0, "damage_out": 0, "damage_in": 0, "healing_out": 0, "healing_in": 0, "kills": 0, "duration_s": 0}
     if ready:
-        encounters = _compute_encounters(character, start_ts, end_ts, limit, ascending=(order == "asc"))
+        encounters = _compute_encounters(character, start_ts, end_ts, npc, limit, ascending=(order == "asc"))
         totals = {
             "count": len(encounters),
             "damage_out": sum(e["damage_out"] for e in encounters),
             "damage_in": sum(e["damage_in"] for e in encounters),
+            "healing_out": sum(e["healing_out"] for e in encounters),
+            "healing_in": sum(e["healing_in"] for e in encounters),
             "kills": sum(e["kills"] for e in encounters),
             "duration_s": sum(e["duration_s"] for e in encounters),
         }
@@ -2522,15 +2568,22 @@ def encounters_browse(
         "totals": totals,
         "ready": ready,
         "known_logs": _known_logs(),
-        "filters": {"character": character, "start_ts": start_ts, "end_ts": end_ts, "limit": limit, "order": order},
+        "filters": {"character": character, "start_ts": start_ts, "end_ts": end_ts, "npc": npc, "limit": limit, "order": order},
     })
 
 
-def _compute_encounter_combat_breakdown(character, start_ts, stop_ts):
-    """Full per-encounter breakdown: every attack type (melee verb or spell
-    name), split by combatant vs NPC and by direction (combatant attacking
-    the NPC, or the NPC attacking the combatant) -- the /attacks page's
-    per-verb granularity, scoped to one encounter and not just to 'you'.
+def _compute_encounter_combat_breakdown(windows, label_self_as_you=True):
+    """Full breakdown across one or more (character, start_ts, stop_ts)
+    windows: every attack type (melee verb or spell name), split by
+    combatant vs NPC and by direction (combatant attacking the NPC, or the
+    NPC attacking the combatant) -- the /attacks page's per-verb
+    granularity, scoped to the given window(s) and not just to 'you'. Each
+    window is OR'd into a single query, so rows from several (possibly
+    disjoint, possibly different-character) windows land in the same
+    verb/npc buckets and merge for free -- this is what powers both a
+    single encounter's breakdown (one window) and a merged multi-encounter
+    breakdown (several windows).
+
     Same two-pass mob-vs-combatant resolution as _compute_encounters/
     api_encounter_detail: confirm mobs via your own engagement first (since
     a proper-named boss and a player name are textually identical), then use
@@ -2538,23 +2591,38 @@ def _compute_encounter_combat_breakdown(character, start_ts, stop_ts):
     lines into combatant vs NPC too. EQL is combat-locked to your own
     group/raid, so anyone showing up this way is legitimately part of it.
 
+    label_self_as_you: when True (the single-encounter case), the window's
+    own log-owner is labelled "You". When merging windows that may belong to
+    different characters, that label would collide between them, so the
+    caller passes False and each log-owner is labelled by their real
+    character name instead.
+
     Returns (verb_rows, npc_totals): verb_rows is the flat per-(combatant,
     npc, verb, direction) list; npc_totals is per-NPC melee/spell damage
     aggregated across every combatant, keyed by NPC name."""
-    clauses = ["c.name = %s", "ev.ts >= %s"]
-    params = [character, start_ts]
-    if stop_ts:
-        clauses.append("ev.ts <= %s")
-        params.append(stop_ts)
+    if not windows:
+        return [], {}
+
+    clauses, params = [], []
+    for w in windows:
+        clause = "(c.name = %s AND ev.ts >= %s"
+        wparams = [w["character"], w["start_ts"]]
+        if w.get("stop_ts"):
+            clause += " AND ev.ts <= %s"
+            wparams.append(w["stop_ts"])
+        clause += ")"
+        clauses.append(clause)
+        params.extend(wparams)
+    where = " OR ".join(clauses)
 
     conn = db.get_connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT ev.source_name, ev.source_type, ev.target_name, ev.target_type, "
-                "ev.event_type, ev.verb, ev.amount, ev.outcome "
+                "ev.event_type, ev.verb, ev.amount, ev.outcome, c.name AS character_name "
                 "FROM events ev JOIN characters c ON ev.character_id=c.id "
-                f"WHERE {' AND '.join(clauses)} "
+                f"WHERE ({where}) "
                 "AND ev.event_type IN ('melee','spell_damage','ability_damage','spell_resist') "
                 "AND ev.verb IS NOT NULL",
                 params,
@@ -2617,12 +2685,12 @@ def _compute_encounter_combat_breakdown(character, start_ts, stop_ts):
         amount = ev["amount"] or 0
         is_melee = ev["event_type"] == "melee"
         if t_is_mob and not s_is_mob:
-            combatant = "You" if s_type == "you" else s_name
+            combatant = ("You" if label_self_as_you else ev["character_name"]) if s_type == "you" else s_name
             npc, direction = canonical_npc(t_name), "out"
             nt = npc_total(npc)
             nt["melee_to" if is_melee else "spell_to"] += amount
         elif s_is_mob and not t_is_mob:
-            combatant = "You" if t_type == "you" else t_name
+            combatant = ("You" if label_self_as_you else ev["character_name"]) if t_type == "you" else t_name
             npc, direction = canonical_npc(s_name), "in"
             nt = npc_total(npc)
             nt["melee_from" if is_melee else "spell_from"] += amount
@@ -2681,13 +2749,116 @@ def _compute_encounter_combat_breakdown(character, start_ts, stop_ts):
     return verb_rows, npc_totals
 
 
-@app.get("/encounters/breakdown", response_class=HTMLResponse)
-def encounter_breakdown(request: Request, character: str, start_ts: str, stop_ts: str = ""):
-    verb_rows, npc_totals = _compute_encounter_combat_breakdown(character, start_ts, stop_ts)
+def _compute_encounter_healing_breakdown(windows, label_self_as_you=True):
+    """Per-(healer, spell) heal breakdown across one or more windows -- same
+    window-OR'ing and You-labeling convention as
+    _compute_encounter_combat_breakdown. Unlike the damage breakdown this
+    isn't split by target: the ask was "who healed with what spell for how
+    much", not a per-target table, so casts of the same spell by the same
+    healer land in one bucket regardless of who they targeted.
 
-    start_dt = datetime.fromisoformat(start_ts)
-    end_dt = datetime.fromisoformat(stop_ts) if stop_ts else datetime.now()
-    duration_s = max(round((end_dt - start_dt).total_seconds()), 1)
+    "effective" is `amount` -- what the target actually gained, already
+    capped by their missing HP -- and "raw"/"overheal" come from the
+    `extra` JSON's potential/overheal (see _heal_extra in eq_legends.py);
+    raw with no cap hit just equals amount, so overheal is 0. Returns a
+    flat list of per-(healer, spell) dicts; the caller aggregates per healer
+    and computes percentages."""
+    if not windows:
+        return []
+
+    clauses, params = [], []
+    for w in windows:
+        clause = "(c.name = %s AND ev.ts >= %s"
+        wparams = [w["character"], w["start_ts"]]
+        if w.get("stop_ts"):
+            clause += " AND ev.ts <= %s"
+            wparams.append(w["stop_ts"])
+        clause += ")"
+        clauses.append(clause)
+        params.extend(wparams)
+    where = " OR ".join(clauses)
+
+    conn = db.get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT ev.source_name, ev.source_type, ev.verb AS spell, ev.amount, ev.outcome, ev.extra, "
+                "c.name AS character_name "
+                "FROM events ev JOIN characters c ON ev.character_id=c.id "
+                f"WHERE ({where}) AND ev.event_type='spell_heal' AND ev.verb IS NOT NULL",
+                params,
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    buckets: dict[tuple, dict] = {}
+
+    def bucket(healer, spell):
+        return buckets.setdefault((healer, spell), {
+            "healer": healer, "spell": spell,
+            "casts": 0, "crits": 0, "effective": 0, "raw": 0, "overheal": 0,
+        })
+
+    for ev in rows:
+        healer = ("You" if label_self_as_you else ev["character_name"]) if ev["source_type"] == "you" else ev["source_name"]
+        extra = json.loads(ev["extra"]) if ev["extra"] else {}
+        amount = ev["amount"] or 0
+
+        b = bucket(healer, ev["spell"])
+        b["casts"] += 1
+        if ev["outcome"] == "crit":
+            b["crits"] += 1
+        b["effective"] += amount
+        b["raw"] += extra.get("potential", amount)
+        b["overheal"] += extra.get("overheal", 0)
+
+    return list(buckets.values())
+
+
+def _build_encounter_healing(windows, label_self_as_you, duration_s):
+    rows = _compute_encounter_healing_breakdown(windows, label_self_as_you)
+
+    def pct(n, den):
+        return round(n / den * 100, 1) if den else None
+
+    def stat_row(name, casts, crits, effective, raw, overheal):
+        return {
+            "name": name, "casts": casts,
+            "crit_pct": pct(crits, casts),
+            "total_heal": raw, "effective_heal": effective, "overheal": overheal,
+            "efficiency_pct": pct(effective, raw),
+            "hps": round(effective / duration_s, 1),
+        }
+
+    by_healer: dict[str, list] = {}
+    for r in rows:
+        by_healer.setdefault(r["healer"], []).append(r)
+
+    healers = []
+    for healer, spells in by_healer.items():
+        spell_rows = [
+            stat_row(s["spell"], s["casts"], s["crits"], s["effective"], s["raw"], s["overheal"])
+            for s in sorted(spells, key=lambda s: -s["effective"])
+        ]
+        summary = stat_row(
+            healer,
+            sum(s["casts"] for s in spells), sum(s["crits"] for s in spells),
+            sum(s["effective"] for s in spells), sum(s["raw"] for s in spells), sum(s["overheal"] for s in spells),
+        )
+        summary["spells"] = spell_rows
+        healers.append(summary)
+    healers.sort(key=lambda h: -h["effective_heal"])
+    return healers
+
+
+def _build_encounter_breakdown_npcs(windows, label_self_as_you, split_you, duration_s):
+    """Shared by the single-encounter and merged-encounters breakdown routes.
+    split_you controls whether the log-owner's own rows get pulled into a
+    dedicated "You" section (single-encounter view) or just sit in the
+    combatant list with everyone else (merged view, where "own" isn't a
+    single well-defined combatant once several characters are merged)."""
+    verb_rows, npc_totals = _compute_encounter_combat_breakdown(windows, label_self_as_you)
 
     # combatant -> direction -> [attack-type rows], per NPC
     by_npc_combatant: dict[str, dict[str, dict[str, list]]] = {}
@@ -2708,7 +2879,7 @@ def encounter_breakdown(request: Request, character: str, start_ts: str, stop_ts
 
     npcs = []
     for npc_name, combatants in by_npc_combatant.items():
-        you_dirs = combatants.pop("You", {"out": [], "in": []})
+        you_dirs = combatants.pop("You", None) if split_you else None
         others = sorted(
             (combatant_summary(name, dirs) for name, dirs in combatants.items()),
             key=lambda c: -c["out_total"],
@@ -2718,17 +2889,79 @@ def encounter_breakdown(request: Request, character: str, start_ts: str, stop_ts
             "npc": npc_name,
             "melee_damage_to": nt["melee_to"], "spell_damage_to": nt["spell_to"],
             "melee_damage_from": nt["melee_from"], "spell_damage_from": nt["spell_from"],
-            "you": combatant_summary("You", you_dirs),
+            "you": combatant_summary("You", you_dirs) if you_dirs is not None else None,
             "others": others,
         })
     npcs.sort(key=lambda n: -(n["melee_damage_to"] + n["spell_damage_to"]))
+    return npcs
+
+
+@app.get("/encounters/breakdown", response_class=HTMLResponse)
+def encounter_breakdown(request: Request, character: str, start_ts: str, stop_ts: str = ""):
+    start_dt = datetime.fromisoformat(start_ts)
+    end_dt = datetime.fromisoformat(stop_ts) if stop_ts else datetime.now()
+    duration_s = max(round((end_dt - start_dt).total_seconds()), 1)
+
+    windows = [{"character": character, "start_ts": start_ts, "stop_ts": stop_ts}]
+    npcs = _build_encounter_breakdown_npcs(windows, label_self_as_you=True, split_you=True, duration_s=duration_s)
+    healers = _build_encounter_healing(windows, label_self_as_you=True, duration_s=duration_s)
 
     return templates.TemplateResponse(request, "encounter_breakdown.html", {
         "npcs": npcs,
+        "healers": healers,
+        "merged": False,
+        "windows": None,
         "start_ts": start_ts,
         "stop_ts": stop_ts or end_dt.isoformat(timespec="seconds"),
         "duration_s": duration_s,
         "filters": {"character": character, "start_ts": start_ts, "stop_ts": stop_ts},
+    })
+
+
+@app.get("/encounters/breakdown/merged", response_class=HTMLResponse)
+def encounter_breakdown_merged(
+    request: Request,
+    character: list[str] = Query(...),
+    start_ts: list[str] = Query(...),
+    stop_ts: list[str] = Query(default=[]),
+):
+    # Aligned by index -- one (character, start_ts, stop_ts) triple per
+    # selected encounter. Missing/blank stop_ts entries pad out to an
+    # open-ended window rather than erroring, same as the single-encounter
+    # route's default.
+    stop_ts = stop_ts + [""] * (len(character) - len(stop_ts))
+    windows = [
+        {"character": c, "start_ts": s, "stop_ts": e or None}
+        for c, s, e in zip(character, start_ts, stop_ts)
+    ]
+    if not windows:
+        raise HTTPException(400, "at least one encounter is required")
+
+    # Combined duration is the sum of each selected encounter's own span,
+    # not the wall-clock distance between the first and last -- these are
+    # disjoint fights merged together, and DPS should reflect only the time
+    # actually spent in them.
+    duration_s = 0.0
+    for w in windows:
+        start_dt = datetime.fromisoformat(w["start_ts"])
+        end_dt = datetime.fromisoformat(w["stop_ts"]) if w["stop_ts"] else datetime.now()
+        duration_s += max((end_dt - start_dt).total_seconds(), 0.1)
+    duration_s = max(round(duration_s), 1)
+
+    npcs = _build_encounter_breakdown_npcs(
+        windows, label_self_as_you=False, split_you=False, duration_s=duration_s,
+    )
+    healers = _build_encounter_healing(windows, label_self_as_you=False, duration_s=duration_s)
+
+    return templates.TemplateResponse(request, "encounter_breakdown.html", {
+        "npcs": npcs,
+        "healers": healers,
+        "merged": True,
+        "windows": windows,
+        "start_ts": windows[0]["start_ts"],
+        "stop_ts": windows[-1]["stop_ts"] or "",
+        "duration_s": duration_s,
+        "filters": {"character": "", "start_ts": "", "stop_ts": ""},
     })
 
 

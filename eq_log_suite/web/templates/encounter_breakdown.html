@@ -1,11 +1,49 @@
 {% extends "base.html" %}
 {% block title %}Encounter Breakdown{% endblock %}
 {% block content %}
-<div id="breakdown-params" data-character="{{ filters.character }}" data-start-ts="{{ start_ts }}" data-stop-ts="{{ stop_ts or '' }}" hidden></div>
+<div id="breakdown-params" data-character="{{ filters.character }}" data-start-ts="{{ start_ts }}" data-stop-ts="{{ stop_ts or '' }}" data-merged="{{ 'yes' if merged else '' }}" hidden></div>
+{% if merged %}
+<h1>Encounter Breakdown -- {{ windows|length }} encounters merged</h1>
+<p style="opacity:0.8;">{{ duration_s }}s combined combat time (sum of each encounter's own duration, not wall-clock span).</p>
+<ul style="opacity:0.8; font-size:0.9rem;">
+  {% for w in windows %}
+  <li>{{ w.character }} -- {{ w.start_ts.replace("T", " ") }} to {{ (w.stop_ts or '(active)').replace("T", " ") }}</li>
+  {% endfor %}
+</ul>
+{% else %}
 <h1>Encounter Breakdown</h1>
 <p>{{ filters.character }} -- {{ start_ts.replace("T", " ") }} to {{ stop_ts.replace("T", " ") }}
 -- {{ duration_s }}s total duration</p>
+{% endif %}
 
+{% macro heal_table(rows) %}
+<div class="scroll-frame">
+<table class="sortable">
+  <thead>
+    <tr>
+      <th>spell</th><th>casts</th><th>crit %</th><th>total heal</th>
+      <th>effective heal</th><th>overheal</th><th>efficiency %</th><th>hps</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for r in rows %}
+    <tr>
+      <td>{{ r.name }}</td>
+      <td>{{ r.casts }}</td>
+      <td>{{ r.crit_pct if r.crit_pct is not none else '' }}</td>
+      <td>{{ r.total_heal }}</td>
+      <td>{{ r.effective_heal }}</td>
+      <td>{{ r.overheal }}</td>
+      <td>{{ r.efficiency_pct if r.efficiency_pct is not none else '' }}</td>
+      <td>{{ r.hps }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endmacro %}
+
+<h2>DPS</h2>
 {% if not npcs %}
 <p>No combat data for this window.</p>
 {% endif %}
@@ -53,13 +91,17 @@
 
   <h2 style="margin-top:0;">
     {{ n.npc }}
+    {% if not merged %}
     <button type="button" class="npc-log-toggle" data-mob="{{ n.npc }}"
       style="font-size:0.8rem; font-weight:400; margin-left:0.6rem;">show log</button>
+    {% endif %}
   </h2>
+  {% if not merged %}
   <div class="npc-log-block" style="display:none; max-height:320px; overflow-y:auto; font-family:monospace;
     font-size:0.8rem; white-space:pre-wrap; background:#12141c; border:1px solid var(--border);
     border-radius:4px; padding:0.5rem; margin:0 0 0.8rem 0;"></div>
   <p style="opacity:0.8;">{{ start_ts.replace("T", " ") }} to {{ stop_ts.replace("T", " ") }} -- {{ duration_s }}s total duration</p>
+  {% endif %}
   <table style="margin-bottom:1rem;">
     <tr><td style="opacity:0.7; padding-right:1rem;">damage done <strong>to</strong> {{ n.npc }}</td>
         <td>melee: {{ n.melee_damage_to }}</td><td>spell: {{ n.spell_damage_to }}</td>
@@ -69,6 +111,7 @@
         <td>total: {{ n.melee_damage_from + n.spell_damage_from }}</td></tr>
   </table>
 
+  {% if n.you %}
   <h3>You</h3>
   {% if n.you.out %}
   <h4>Outgoing (You &rarr; {{ n.npc }}) -- {{ n.you.out_total }} total damage in {{ duration_s }}s ({{ n.you.out_dps }} dps)</h4>
@@ -81,9 +124,10 @@
   {% if not n.you.out and not n.you['in'] %}
   <p style="opacity:0.7;">No direct combat with {{ n.npc }}.</p>
   {% endif %}
+  {% endif %}
 
   {% if n.others %}
-  <h3>Everyone else</h3>
+  <h3>{{ 'Everyone else' if n.you else 'Combatants' }}</h3>
   <div class="others-block" data-npc="{{ n.npc }}">
     <button type="button" class="expand-all" style="margin-bottom:0.4rem;">expand all</button>
     <div class="scroll-frame">
@@ -122,6 +166,45 @@
 
 </div>
 {% endfor %}
+
+<h2>Healing</h2>
+{% if not healers %}
+<p style="opacity:0.8;">No healing done in this window.</p>
+{% else %}
+<div class="others-block" data-npc="__healing__">
+  <button type="button" class="expand-all" style="margin-bottom:0.4rem;">expand all</button>
+  <div class="scroll-frame">
+  <table class="others-summary">
+    <thead>
+      <tr>
+        <th>healer</th><th>casts</th><th>crit %</th><th>total heal</th>
+        <th>effective heal</th><th>overheal</th><th>efficiency %</th><th>hps</th><th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for h in healers %}
+      <tr class="others-summary-row">
+        <td>{{ h.name }}</td>
+        <td>{{ h.casts }}</td>
+        <td>{{ h.crit_pct if h.crit_pct is not none else '' }}</td>
+        <td>{{ h.total_heal }}</td>
+        <td>{{ h.effective_heal }}</td>
+        <td>{{ h.overheal }}</td>
+        <td>{{ h.efficiency_pct if h.efficiency_pct is not none else '' }}</td>
+        <td>{{ h.hps }}</td>
+        <td><button type="button" class="expand-one">expand</button></td>
+      </tr>
+      <tr class="others-detail-row" style="display:none;">
+        <td colspan="9">
+          {{ heal_table(h.spells) }}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</div>
+{% endif %}
 
 <script>
   // Direct log entries for one NPC's whole breakdown block, filtered to
