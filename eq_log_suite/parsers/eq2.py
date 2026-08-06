@@ -20,7 +20,7 @@ raw_lines.
 import re
 
 from eq_log_suite.models import ParsedEvent
-from eq_log_suite.parsers.base import GameParser
+from eq_log_suite.parsers.base import GameParser, strip_item_article
 
 
 def h_ability_hit_self(m):
@@ -214,7 +214,7 @@ def h_mob_loot(m):
     return ParsedEvent(
         ts=None, raw_line=None, event_type="loot",
         source_name=source, source_type=GameParser.classify_actor(source),
-        target_name=m.group("item"), target_type="item",
+        target_name=strip_item_article(m.group("item")), target_type="item",
         verb=None, amount=1, outcome=None,
         extra={"via": "chest" if m.group("via").lower().startswith("the treasure") else "corpse"},
     )

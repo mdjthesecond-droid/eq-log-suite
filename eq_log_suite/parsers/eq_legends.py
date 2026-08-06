@@ -9,7 +9,7 @@ still land in `raw_lines`, so nothing is lost and coverage can grow later.
 import re
 
 from eq_log_suite.models import ParsedEvent
-from eq_log_suite.parsers.base import GameParser
+from eq_log_suite.parsers.base import GameParser, strip_item_article
 
 # Third-person conjugated melee verbs seen (or expected) in combat lines,
 # e.g. "Gonekab crushes Baron Telyx V`Zher for 13 points of damage."
@@ -610,7 +610,7 @@ def h_loot(m):
     return ParsedEvent(
         ts=None, raw_line=None, event_type="loot",
         source_name=m.group("source"), source_type="npc",
-        target_name=m.group("item"), target_type="item",
+        target_name=strip_item_article(m.group("item")), target_type="item",
         verb=None, amount=qty, outcome=None,
     )
 

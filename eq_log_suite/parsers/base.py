@@ -96,3 +96,19 @@ def normalize_actor_name(name: Optional[str]) -> Optional[str]:
     if not name:
         return name
     return _LEADING_ARTICLE_RE.sub(lambda m: m.group(1).lower() + " ", name)
+
+
+# Item names, unlike actor names, are looted with a grammatical article that
+# isn't part of the item itself ("You looted a Malachite...", "You loot
+# \aITEM...:a poison gland\/a..."), so it should be dropped rather than
+# case-normalized. Deliberately only strips a lowercase "a "/"an " -- a
+# capitalized "A "/"An " is a real proper-noun item name (confirmed real:
+# "A Foul Wind", an EQ2 loot drop), same rationale as _LEADING_ARTICLE_RE
+# above but the opposite conclusion for items vs. actors.
+_LEADING_ITEM_ARTICLE_RE = re.compile(r"^(?:a|an) ")
+
+
+def strip_item_article(name: Optional[str]) -> Optional[str]:
+    if not name:
+        return name
+    return _LEADING_ITEM_ARTICLE_RE.sub("", name)
