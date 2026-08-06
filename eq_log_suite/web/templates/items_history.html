@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}{{ item }} -- History{% endblock %}
+{% block content %}
+<h1>{{ item }} <span style="font-weight:400; font-size:1rem; opacity:0.8;">-- snapshot history</span></h1>
+<p><a href="/items">&larr; All items</a></p>
+<p>Every confirmed snapshot for this item, oldest first -- nothing here is ever overwritten, so this
+is the place to actually check whether tier/tier progress changed between screenshots (rather than
+just assuming it did). Once that's confirmed one way or the other, duplicate/unchanged snapshots can
+be cleaned up.</p>
+
+<div class="scroll-frame">
+<table class="sortable">
+  <thead>
+    <tr><th>confirmed</th><th>tier</th><th>upgradeable</th><th>exaltations</th><th>stats</th><th>note</th><th>screenshot</th></tr>
+  </thead>
+  <tbody>
+    {% for r in rows %}
+    <tr>
+      <td>{{ r.confirmed_at }}</td>
+      <td>{% if r.tier is not none %}{{ r.tier }}{% if r.tier_progress %} ({{ r.tier_progress }}){% endif %}{% endif %}</td>
+      <td>{% if r.upgradeable is not none %}{{ 'yes' if r.upgradeable else 'no' }}{% endif %}</td>
+      <td style="white-space:pre-wrap;">{{ r.exaltations or '' }}</td>
+      <td>{% for k, v in r.stats.items() %}<span style="white-space:nowrap;">{{ k }}: {{ v|join(' ') if v is not string else v }}</span>{% if not loop.last %}, {% endif %}{% endfor %}</td>
+      <td>{{ r.note or '' }}</td>
+      <td>{% if r.screenshot_url %}<a href="{{ r.screenshot_url }}" target="_blank">view</a>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endblock %}

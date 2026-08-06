@@ -1,0 +1,184 @@
+{% extends "base.html" %}
+{% block title %}{{ base_name }}{% endblock %}
+{% block content %}
+<h1>{{ item }}</h1>
+<p><a href="/items">&larr; All items</a> &middot; <a href="/items/history?item={{ item|urlencode }}">Re-confirm history for this exact tier ({{ variants|selectattr('item', 'equalto', item)|list|length }})</a></p>
+
+{% if variants|length > 1 %}
+<form method="get" action="/items/detail" style="margin-bottom:0.6rem;">
+  <input type="hidden" name="item" value="{{ base_name }}">
+  <label>Tier / progress <span style="opacity:0.7;">({{ variants|length }} snapshots for this item)</span><br>
+    <select name="id" onchange="this.form.submit()">
+      {% for v in variants %}
+      <option value="{{ v.id }}" {{ 'selected' if v.selected }}>{{ v.label }}</option>
+      {% endfor %}
+    </select>
+  </label>
+</form>
+{% endif %}
+
+<p>
+  {% if latest.tier is not none %}<strong>Tier</strong> {{ latest.tier }}{% if latest.tier_progress %} ({{ latest.tier_progress }}){% endif %}{% endif %}
+  {% if latest.upgradeable is not none %}&middot; <strong>Upgradeable:</strong> {{ 'yes' if latest.upgradeable else 'no' }}{% endif %}
+  &middot; <span style="opacity:0.7;">confirmed {{ latest.confirmed_at }}</span>
+</p>
+{% if latest.note %}<p style="opacity:0.8;">{{ latest.note }}</p>{% endif %}
+
+<datalist id="known-items">
+  {% for name in known_items %}<option value="{{ name }}">{% endfor %}
+</datalist>
+
+<details style="margin-bottom:0.8rem;">
+  <summary>Edit this snapshot</summary>
+  <p style="opacity:0.7;">Fixes a mistake on <em>this exact snapshot</em> in place -- it does not create a
+  new history entry. A real tier/progress change belongs in a new screenshot confirmed normally
+  instead, so it's tracked as its own point in the item's history.</p>
+  <form method="post" action="/items/update" style="border:1px solid var(--border-color, #333); border-radius:6px; padding:0.8rem;">
+    <input type="hidden" name="id" value="{{ latest.id }}">
+    <label>Item name<br>
+      <input name="item" list="known-items" value="{{ latest.item }}" style="width:100%;" required>
+    </label><br><br>
+    <div style="display:flex; gap:1rem; align-items:flex-end;">
+      <label>Tier<br>
+        <input name="tier" value="{{ latest.tier if latest.tier is not none else '' }}" style="width:80px;">
+      </label>
+      <label>Tier progress (X/Y)<br>
+        <input name="tier_progress" value="{{ latest.tier_progress or '' }}" style="width:100px;">
+      </label>
+      <label>Upgradeable<br>
+        <select name="upgradeable">
+          <option value="" {{ 'selected' if latest.upgradeable is none }}>unknown</option>
+          <option value="yes" {{ 'selected' if latest.upgradeable == 1 }}>yes</option>
+          <option value="no" {{ 'selected' if latest.upgradeable == 0 }}>no</option>
+        </select>
+      </label>
+    </div><br>
+    <label>Exaltations<br>
+      <textarea name="exaltations" rows="5" style="width:100%;">{{ exaltations or '' }}</textarea>
+    </label><br><br>
+    <div>
+      <span style="opacity:0.7;">Stats -- clear a value to drop that field, or fill in a blank row to add one:</span>
+      <table style="margin-top:0.3rem;">
+        {% for label, value in stats.items() %}
+        <tr>
+          <td><input type="hidden" name="field_label" value="{{ label }}">{{ label }}</td>
+          <td><input name="field_value" value="{{ value|join(' ') if value is not string else value }}" style="width:220px;"></td>
+        </tr>
+        {% endfor %}
+        {% for _ in range(4) %}
+        <tr>
+          <td><input name="field_label" placeholder="label" style="width:140px;"></td>
+          <td><input name="field_value" placeholder="value" style="width:220px;"></td>
+        </tr>
+        {% endfor %}
+      </table>
+    </div><br>
+    <label>Note<br>
+      <input name="note" value="{{ latest.note or '' }}" style="width:100%;">
+    </label><br><br>
+    <button type="submit">Save changes</button>
+  </form>
+  <form method="post" action="/items/delete" style="margin-top:0.6rem;"
+        onsubmit="return confirm('Delete this snapshot permanently? This can\'t be undone.');">
+    <input type="hidden" name="id" value="{{ latest.id }}">
+    <input type="hidden" name="item" value="{{ latest.item }}">
+    <button type="submit" style="color:#c9392f;">Delete this snapshot (confirmed in error)</button>
+  </form>
+</details>
+
+<div style="display:flex; gap:1.5rem; flex-wrap:wrap;">
+  <div style="flex:0 0 auto;">
+    {% if latest.screenshot_url %}
+    <a href="{{ latest.screenshot_url }}" target="_blank">
+      <img src="{{ latest.screenshot_url }}" alt="screenshot" style="max-width:280px; border-radius:6px;">
+    </a>
+    {% endif %}
+  </div>
+
+  <div style="flex:1 1 400px; min-width:300px;">
+    <table class="sortable">
+      <tbody>
+        {% for k in ('Class', 'Race', 'Slot', 'Flags') %}
+        {% if k in meta %}
+        <tr><td><strong>{{ k }}</strong></td><td>{{ meta[k]|join(' ') if meta[k] is not string else meta[k] }}</td></tr>
+        {% endif %}
+        {% endfor %}
+      </tbody>
+    </table>
+
+    <!-- Top section: mirrors the item window's own left/right columns
+         (Size/Weight/Skill/Ratio | AC/HP/Mana/Haste/etc.) -->
+    <div style="display:flex; gap:2rem; margin-top:0.8rem;">
+      <table><tbody>
+        {% for k, v in grouped.top_left.items() %}
+        <tr><td>{{ k }}</td><td>{{ v }}</td></tr>
+        {% endfor %}
+      </tbody></table>
+      <table><tbody>
+        {% for k, v in grouped.top_right.items() %}
+        <tr><td>{{ k }}</td><td>{{ v }}</td></tr>
+        {% endfor %}
+      </tbody></table>
+    </div>
+
+    <!-- Middle section: character stats / saves / regens as three columns -->
+    <div style="display:flex; gap:2rem; margin-top:0.8rem;">
+      <table><tbody>
+        {% for k, v in grouped.char.items() %}
+        <tr><td>{{ k }}</td><td>{{ v }}</td></tr>
+        {% endfor %}
+      </tbody></table>
+      <table><tbody>
+        {% for k, v in grouped.save.items() %}
+        <tr><td>{{ k }}</td><td>{{ v }}</td></tr>
+        {% endfor %}
+      </tbody></table>
+      <table><tbody>
+        {% for k, v in grouped.regen.items() %}
+        <tr><td>{{ k }}</td><td>{{ v }}</td></tr>
+        {% endfor %}
+      </tbody></table>
+    </div>
+
+    <!-- Bottom section: exaltations + effects, same grouping as the item window -->
+    {% if exaltations or effects %}
+    <div style="margin-top:0.8rem;">
+      {% if exaltations %}<pre style="white-space:pre-wrap; opacity:0.9;">{{ exaltations }}</pre>{% endif %}
+      {% for k, v in effects.items() %}
+      <div><strong>{{ k }}:</strong> {{ v }}</div>
+      {% endfor %}
+    </div>
+    {% endif %}
+  </div>
+</div>
+
+<h2 style="margin-top:1.5rem;">Drop info</h2>
+{% if not loot_rows %}
+<p style="opacity:0.7;">No loot events matched this item name yet.</p>
+{% else %}
+{% if loot_truncated %}<p style="opacity:0.8;">List truncated, see <a href="/loot/eql?item={{ item|urlencode }}">full search</a>.</p>{% endif %}
+<table class="sortable">
+  <thead>
+    <tr><th>zone</th><th>npc</th><th>level</th><th>avg qty</th><th>chance %</th><th>drops</th></tr>
+  </thead>
+  <tbody>
+    {% for r in loot_rows %}
+    <tr>
+      <td>
+        {% if r.zone == '(unknown zone)' %}{{ r.zone }}
+        {% else %}<a href="/zoneinfo/eql/detail?zone={{ r.zone|urlencode }}">{{ r.zone }}</a>{% endif %}
+      </td>
+      <td>
+        {% if r.npc == '(unknown npc)' %}{{ r.npc }}
+        {% else %}<a href="/npcs/eql/detail?npc={{ r.npc|urlencode }}">{{ r.npc }}</a>{% endif %}
+      </td>
+      <td>{{ r.level or '' }}</td>
+      <td>{{ r.avg_qty }}</td>
+      <td>{{ r.chance_pct if r.chance_pct is not none else '?' }}%</td>
+      <td>{{ r.drops }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endblock %}

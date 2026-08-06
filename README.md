@@ -45,10 +45,11 @@ sudo mariadb -e "CREATE DATABASE eqlogs; CREATE USER 'eqlogs'@'localhost' IDENTI
 ## Everyday use -- launching manually or via desktop launchers
 
 The simplest path is the shell scripts in `bin/` (`start-tailer.sh`,
-`start-overlay.sh`, `start-mangohud-alerts.sh`, `start-web.sh`, `stop-all.sh`).
-All are safe to re-run -- they check what's already running before starting
-anything new. Logs from each go to `logs/tailer.log`, `logs/overlay.log`,
-`logs/mangohud_alerts.log`, `logs/web.log`.
+`start-overlay.sh`, `start-mangohud-alerts.sh`, `start-web.sh`,
+`start-item-capture-watcher.sh`, `stop-all.sh`). All are safe to re-run --
+they check what's already running before starting anything new. Logs from
+each go to `logs/tailer.log`, `logs/overlay.log`, `logs/mangohud_alerts.log`,
+`logs/web.log`, `logs/item_capture_watcher.log`.
 
 - **Tailer** (`start-tailer.sh`) -- starts just the live tailer. This is the
   normal one to run before you play.
@@ -64,8 +65,11 @@ anything new. Logs from each go to `logs/tailer.log`, `logs/overlay.log`,
   limitation, not something fixable from app settings like
   `WindowsBlockCompositing` -- the real fix (below) is graphics-API-level
   overlay injection, same approach as MangoHud/Steam's own overlay.
+- **Item capture watcher** (`start-item-capture-watcher.sh`) -- OCRs item-window
+  screenshots dropped into `item_capture.screenshot_dir` (config/local.yaml)
+  into a review queue at `/items/review`; see `eq_log_suite/item_capture_watcher.py`.
 - **Stop** (`stop-all.sh`) -- stops the tailer, overlay, MangoHud alert
-  writer, and web UI, whichever of them are running.
+  writer, item capture watcher, and web UI, whichever of them are running.
 
 If you'd like desktop-launcher entries (e.g. KDE's application menu) instead
 of running scripts from a terminal, create `.desktop` files in
