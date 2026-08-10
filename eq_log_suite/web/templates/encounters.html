@@ -47,8 +47,9 @@ a few weeks of history.</p>
 <h2>Filter</h2>
 <form method="get" action="/encounters">
   <input name="character" placeholder="character (required)" value="{{ filters.character }}" required>
-  <input name="start_ts" type="datetime-local" title="start (required)" value="{{ filters.start_ts }}" required>
-  <input name="end_ts" type="datetime-local" title="end (required)" value="{{ filters.end_ts }}" required>
+  <input id="start-ts-input" name="start_ts" type="datetime-local" title="start (required)" value="{{ filters.start_ts }}" required>
+  <input id="end-ts-input" name="end_ts" type="datetime-local" title="end (required)" value="{{ filters.end_ts }}" required>
+  <button type="button" id="today-btn" title="fill start/end with today, 00:00 to now">Today</button>
   <input name="npc" placeholder="npc name (optional, e.g. Vox)" value="{{ filters.npc }}">
   <input name="limit" type="number" min="0" max="5000" title="max results (0 = unlimited)" value="{{ filters.limit }}" style="width:90px;">
   <select name="order">
@@ -110,6 +111,19 @@ a few weeks of history.</p>
 </div>
 
 <script>
+  // Fills the date range with today, 00:00 through right now -- so a same-day
+  // lookup doesn't require typing both timestamps by hand every time.
+  function pad(n) { return String(n).padStart(2, "0"); }
+  function localDatetimeValue(d) {
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+  document.getElementById("today-btn").addEventListener("click", () => {
+    const now = new Date();
+    const midnight = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    document.getElementById("start-ts-input").value = localDatetimeValue(midnight);
+    document.getElementById("end-ts-input").value = localDatetimeValue(now);
+  });
+
   const loadedDetails = new Set();
   function fmtPct(p) { return (p === null || p === undefined) ? "--" : p + "%"; }
   function esc(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
@@ -183,7 +197,7 @@ a few weeks of history.</p>
       }
 
       const table = document.createElement("table");
-      table.innerHTML = "<thead><tr><th>mob</th><th>dmg out</th><th>dmg in</th>" +
+      table.innerHTML = "<thead><tr><th></th><th>mob</th><th>dmg out</th><th>dmg in</th>" +
         "<th>my hit%</th><th>my crit%</th><th>their hit%</th><th>their crit%</th>" +
         "<th>my evasion%</th><th>their resist%</th><th>my DS dmg</th><th>their DS dmg</th>" +
         "<th>contributors (dmg out)</th><th></th></tr></thead><tbody></tbody>";
@@ -193,7 +207,7 @@ a few weeks of history.</p>
         const tr = document.createElement("tr");
         const contribText = (m.contributors || [])
           .map(c => `${esc(c.name)}: ${c.damage_out.toLocaleString()}`).join(", ");
-        tr.innerHTML = `<td>${esc(m.mob)}</td><td>${m.damage_out.toLocaleString()}</td><td>${m.damage_in.toLocaleString()}</td>` +
+        tr.innerHTML = `<td></td><td>${esc(m.mob)}</td><td>${m.damage_out.toLocaleString()}</td><td>${m.damage_in.toLocaleString()}</td>` +
           `<td>${fmtPct(m.hit_pct)}</td><td>${fmtPct(m.crit_pct)}</td>` +
           `<td>${fmtPct(m.their_hit_pct)}</td><td>${fmtPct(m.their_crit_pct)}</td>` +
           `<td>${fmtPct(m.evasion_pct)}</td><td>${fmtPct(m.resist_pct)}</td>` +
@@ -201,9 +215,20 @@ a few weeks of history.</p>
           `<td style="font-size:0.85rem;">${contribText}</td><td></td>`;
         tbody.appendChild(tr);
 
+        // Per-mob checkbox -- cherry-picks just this mob's combat out of the
+        // encounter for the merge, instead of the whole thing. Mutually
+        // exclusive with the encounter-level checkbox in the <summary> (see
+        // wireMobSelect): merging both would double-count this mob's damage.
+        const mobCheckbox = document.createElement("input");
+        mobCheckbox.type = "checkbox";
+        mobCheckbox.className = "mob-select";
+        mobCheckbox.title = `select just ${m.mob} to merge with other encounters/mobs`;
+        wireMobSelect(mobCheckbox, details, { ...baseParams, npc: m.mob });
+        tr.firstElementChild.appendChild(mobCheckbox);
+
         const logRow = document.createElement("tr");
         const logCell = document.createElement("td");
-        logCell.colSpan = 13;
+        logCell.colSpan = 14;
         const mobLogBlock = logBlock();
         logCell.appendChild(mobLogBlock);
         logRow.appendChild(logCell);
@@ -232,39 +257,72 @@ a few weeks of history.</p>
   });
 
   // ---- Multi-select + merge: pick several encounters (e.g. a string of
-  // trash pulls, or repeated attempts on the same boss) and open a combined
-  // breakdown that sums them into one set of totals instead of viewing each
-  // separately.
-  const selectedEncounters = new Map();
-  function encSelectKey(cb) { return `${cb.dataset.character}|${cb.dataset.startTs}|${cb.dataset.stopTs}`; }
+  // trash pulls, or repeated attempts on the same boss), or cherry-pick
+  // individual mobs out of an expanded encounter, and open a combined
+  // breakdown that sums them all into one merged outgoing/incoming/healing
+  // view instead of viewing each separately. selectedItems holds both kinds
+  // of selection -- an encounter-level pick has npc: "", a mob-level pick
+  // has npc set -- keyed so the two can't collide.
+  const selectedItems = new Map();
+  function itemKey(character, startTs, stopTs, npc) { return `${character}|${startTs}|${stopTs}|${npc || ""}`; }
   function updateMergeBar() {
-    const n = selectedEncounters.size;
+    const n = selectedItems.size;
     document.getElementById("merge-bar").style.display = n >= 2 ? "" : "none";
-    document.getElementById("merge-count").textContent = `${n} encounter(s) selected`;
+    document.getElementById("merge-count").textContent = `${n} item(s) selected`;
   }
   document.querySelectorAll(".enc-select").forEach((cb) => {
     cb.addEventListener("change", () => {
-      const key = encSelectKey(cb);
+      const character = cb.dataset.character, startTs = cb.dataset.startTs, stopTs = cb.dataset.stopTs;
+      const encKey = itemKey(character, startTs, stopTs, "");
       if (cb.checked) {
-        selectedEncounters.set(key, { character: cb.dataset.character, start_ts: cb.dataset.startTs, stop_ts: cb.dataset.stopTs });
+        selectedItems.set(encKey, { character, start_ts: startTs, stop_ts: stopTs, npc: "" });
+        // Whole-encounter and per-mob selection are mutually exclusive for
+        // the same encounter -- picking the whole thing clears any mobs
+        // already cherry-picked out of it (merging both double-counts them).
+        const prefix = `${character}|${startTs}|${stopTs}|`;
+        for (const k of [...selectedItems.keys()]) {
+          if (k !== encKey && k.startsWith(prefix)) selectedItems.delete(k);
+        }
+        cb.closest(".encounter-row").querySelectorAll(".mob-select").forEach((mcb) => { mcb.checked = false; });
       } else {
-        selectedEncounters.delete(key);
+        selectedItems.delete(encKey);
       }
       updateMergeBar();
     });
   });
+  // Wires a per-mob checkbox (created when an encounter row is expanded):
+  // same mutual-exclusion rule as above, the other direction -- picking a
+  // mob clears the encounter-level checkbox for its row.
+  function wireMobSelect(checkbox, details, params) {
+    const encKey = itemKey(params.character, params.start_ts, params.stop_ts, "");
+    const mobKey = itemKey(params.character, params.start_ts, params.stop_ts, params.npc);
+    checkbox.checked = selectedItems.has(mobKey);
+    checkbox.addEventListener("change", () => {
+      if (checkbox.checked) {
+        selectedItems.set(mobKey, params);
+        if (selectedItems.delete(encKey)) {
+          const encCheckbox = details.querySelector(".enc-select");
+          if (encCheckbox) encCheckbox.checked = false;
+        }
+      } else {
+        selectedItems.delete(mobKey);
+      }
+      updateMergeBar();
+    });
+  }
   document.getElementById("merge-btn").addEventListener("click", () => {
     const params = new URLSearchParams();
-    for (const w of selectedEncounters.values()) {
+    for (const w of selectedItems.values()) {
       params.append("character", w.character);
       params.append("start_ts", w.start_ts);
       params.append("stop_ts", w.stop_ts);
+      params.append("npc", w.npc || "");
     }
     window.open(`/encounters/breakdown/merged?${params}`, "_blank");
   });
   document.getElementById("merge-clear").addEventListener("click", () => {
-    selectedEncounters.clear();
-    document.querySelectorAll(".enc-select").forEach((cb) => { cb.checked = false; });
+    selectedItems.clear();
+    document.querySelectorAll(".enc-select, .mob-select").forEach((cb) => { cb.checked = false; });
     updateMergeBar();
   });
 </script>

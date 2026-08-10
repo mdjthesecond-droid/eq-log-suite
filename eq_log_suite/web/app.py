@@ -3410,7 +3410,7 @@ def encounters_browse(
 
 
 def _compute_encounter_combat_breakdown(windows, label_self_as_you=True):
-    """Full breakdown across one or more (character, start_ts, stop_ts)
+    """Full breakdown across one or more (character, start_ts, stop_ts[, npc])
     windows: every attack type (melee verb or spell name), split by
     combatant vs NPC and by direction (combatant attacking the NPC, or the
     NPC attacking the combatant) -- the /attacks page's per-verb
@@ -3420,6 +3420,13 @@ def _compute_encounter_combat_breakdown(windows, label_self_as_you=True):
     verb/npc buckets and merge for free -- this is what powers both a
     single encounter's breakdown (one window) and a merged multi-encounter
     breakdown (several windows).
+
+    A window may optionally carry an 'npc' filter (case-insensitive) -- used
+    when the caller cherry-picked one specific mob out of an encounter
+    rather than the whole thing (see /encounters' per-mob checkboxes). A row
+    is kept if it falls in *any* window's character+time range AND, when
+    that window has an npc filter, the row's mob-side name matches it; an
+    unfiltered window covering the same range always lets the row through.
 
     Same two-pass mob-vs-combatant resolution as _compute_encounters/
     api_encounter_detail: confirm mobs via your own engagement first (since
@@ -3434,11 +3441,14 @@ def _compute_encounter_combat_breakdown(windows, label_self_as_you=True):
     caller passes False and each log-owner is labelled by their real
     character name instead.
 
-    Returns (verb_rows, npc_totals): verb_rows is the flat per-(combatant,
-    npc, verb, direction) list; npc_totals is per-NPC melee/spell damage
-    aggregated across every combatant, keyed by NPC name."""
+    Returns (verb_rows, npc_totals, totals_rows): verb_rows is the flat
+    per-(combatant, npc, verb, direction) list; npc_totals is per-NPC melee/
+    spell damage aggregated across every combatant, keyed by NPC name;
+    totals_rows is the same per-verb data but merged across NPCs too --
+    per-(combatant, verb, direction), for a single "whole thing merged"
+    outgoing/incoming view instead of one broken out per mob."""
     if not windows:
-        return [], {}
+        return [], {}, []
 
     clauses, params = [], []
     for w in windows:
@@ -3452,11 +3462,35 @@ def _compute_encounter_combat_breakdown(windows, label_self_as_you=True):
         params.extend(wparams)
     where = " OR ".join(clauses)
 
+    # Parsed once for the per-row npc-filter check below, rather than
+    # re-parsing each window's timestamps for every row.
+    parsed_windows = [
+        {
+            "character": w["character"],
+            "start_dt": datetime.fromisoformat(w["start_ts"]),
+            "stop_dt": datetime.fromisoformat(w["stop_ts"]) if w.get("stop_ts") else None,
+            "npc": (w.get("npc") or "").lower() or None,
+        }
+        for w in windows
+    ]
+
+    def row_allowed(character_name, ts, npc_name):
+        npc_lower = npc_name.lower()
+        for w in parsed_windows:
+            if w["character"] != character_name:
+                continue
+            if ts < w["start_dt"] or (w["stop_dt"] is not None and ts > w["stop_dt"]):
+                continue
+            if w["npc"] is not None and w["npc"] != npc_lower:
+                continue
+            return True
+        return False
+
     conn = db.get_connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT ev.source_name, ev.source_type, ev.target_name, ev.target_type, "
+                "SELECT ev.ts, ev.source_name, ev.source_type, ev.target_name, ev.target_type, "
                 "ev.event_type, ev.verb, ev.amount, ev.outcome, c.name AS character_name "
                 "FROM events ev JOIN characters c ON ev.character_id=c.id "
                 f"WHERE ({where}) "
@@ -3494,16 +3528,27 @@ def _compute_encounter_combat_breakdown(windows, label_self_as_you=True):
     def canonical_npc(name):
         return npc_display.setdefault(name.lower(), name)
 
-    buckets: dict[tuple, dict] = {}
-
-    def bucket(combatant, npc, verb, direction):
-        key = (combatant, npc, verb, direction)
-        return buckets.setdefault(key, {
-            "combatant": combatant, "npc": npc, "verb": verb, "direction": direction,
+    def new_bucket(**identity):
+        return {
+            **identity,
             "attempts": 0, "landed": 0, "crits": 0, "misses": 0,
             "dodged": 0, "parried": 0, "blocked": 0, "riposted": 0, "resisted": 0,
             "hit_amounts": [], "crit_amounts": [],
-        })
+        }
+
+    # Per-(combatant, npc, verb, direction), for the single-encounter/
+    # per-mob view, and per-(combatant, verb, direction) -- the same data
+    # merged across every NPC -- for the "whole thing merged" totals view.
+    buckets: dict[tuple, dict] = {}
+    totals_buckets: dict[tuple, dict] = {}
+
+    def bucket(combatant, npc, verb, direction):
+        key = (combatant, npc, verb, direction)
+        return buckets.setdefault(key, new_bucket(combatant=combatant, npc=npc, verb=verb, direction=direction))
+
+    def totals_bucket(combatant, verb, direction):
+        key = (combatant, verb, direction)
+        return totals_buckets.setdefault(key, new_bucket(combatant=combatant, verb=verb, direction=direction))
 
     # NPC-level totals: melee vs spell, aggregated across every combatant --
     # "how much did the whole group do to this NPC" / "how much did the NPC
@@ -3524,47 +3569,53 @@ def _compute_encounter_combat_breakdown(windows, label_self_as_you=True):
         if t_is_mob and not s_is_mob:
             combatant = ("You" if label_self_as_you else ev["character_name"]) if s_type == "you" else s_name
             npc, direction = canonical_npc(t_name), "out"
-            nt = npc_total(npc)
-            nt["melee_to" if is_melee else "spell_to"] += amount
         elif s_is_mob and not t_is_mob:
             combatant = ("You" if label_self_as_you else ev["character_name"]) if t_type == "you" else t_name
             npc, direction = canonical_npc(s_name), "in"
-            nt = npc_total(npc)
-            nt["melee_from" if is_melee else "spell_from"] += amount
         else:
             continue  # both or neither side reads as a mob -- too ambiguous to place
 
-        b = bucket(combatant, npc, ev["verb"], direction)
-        b["attempts"] += 1
+        if not row_allowed(ev["character_name"], ev["ts"], npc):
+            continue  # excluded by an npc-scoped window (a cherry-picked mob, not this one)
+
+        nt = npc_total(npc)
+        nt["melee_to" if (is_melee and direction == "out") else
+           "spell_to" if direction == "out" else
+           "melee_from" if is_melee else "spell_from"] += amount
+
         outcome = ev["outcome"]
-        if outcome in ("hit", "crit"):
-            b["landed"] += 1
-            if ev["amount"]:
-                b["crit_amounts" if outcome == "crit" else "hit_amounts"].append(ev["amount"])
-            if outcome == "crit":
-                b["crits"] += 1
-        elif outcome == "miss":
-            b["misses"] += 1
-        elif outcome == "dodge":
-            b["dodged"] += 1
-        elif outcome == "parry":
-            b["parried"] += 1
-        elif outcome == "block":
-            b["blocked"] += 1
-        elif outcome == "riposte":
-            b["riposted"] += 1
-        elif outcome == "resist":
-            b["resisted"] += 1
+        for b in (bucket(combatant, npc, ev["verb"], direction), totals_bucket(combatant, ev["verb"], direction)):
+            b["attempts"] += 1
+            if outcome in ("hit", "crit"):
+                b["landed"] += 1
+                if ev["amount"]:
+                    b["crit_amounts" if outcome == "crit" else "hit_amounts"].append(ev["amount"])
+                if outcome == "crit":
+                    b["crits"] += 1
+            elif outcome == "miss":
+                b["misses"] += 1
+            elif outcome == "dodge":
+                b["dodged"] += 1
+            elif outcome == "parry":
+                b["parried"] += 1
+            elif outcome == "block":
+                b["blocked"] += 1
+            elif outcome == "riposte":
+                b["riposted"] += 1
+            elif outcome == "resist":
+                b["resisted"] += 1
 
     def pct(n, den):
         return round(n / den * 100, 1) if den else None
 
-    verb_rows = []
-    for b in buckets.values():
+    def shape(b):
         attempts, landed = b["attempts"], b["landed"]
         hit_amts, crit_amts = b["hit_amounts"], b["crit_amounts"]
-        verb_rows.append({
-            "combatant": b["combatant"], "npc": b["npc"], "verb": b["verb"], "direction": b["direction"],
+        row = {k: v for k, v in b.items() if k not in (
+            "attempts", "landed", "crits", "misses", "dodged", "parried",
+            "blocked", "riposted", "resisted", "hit_amounts", "crit_amounts",
+        )}
+        row.update({
             "total_damage": sum(hit_amts) + sum(crit_amts),
             "attempts": attempts,
             "hit_pct": pct(landed, attempts),
@@ -3582,8 +3633,13 @@ def _compute_encounter_combat_breakdown(windows, label_self_as_you=True):
             "avg_crit": round(sum(crit_amts) / len(crit_amts), 1) if crit_amts else None,
             "max_crit": max(crit_amts) if crit_amts else None,
         })
+        return row
+
+    verb_rows = [shape(b) for b in buckets.values()]
     verb_rows.sort(key=lambda r: (r["npc"], r["combatant"], r["direction"], -r["attempts"]))
-    return verb_rows, npc_totals
+    totals_rows = [shape(b) for b in totals_buckets.values()]
+    totals_rows.sort(key=lambda r: (r["combatant"], r["direction"], -r["attempts"]))
+    return verb_rows, npc_totals, totals_rows
 
 
 def _compute_encounter_healing_breakdown(windows, label_self_as_you=True):
@@ -3695,7 +3751,7 @@ def _build_encounter_breakdown_npcs(windows, label_self_as_you, split_you, durat
     dedicated "You" section (single-encounter view) or just sit in the
     combatant list with everyone else (merged view, where "own" isn't a
     single well-defined combatant once several characters are merged)."""
-    verb_rows, npc_totals = _compute_encounter_combat_breakdown(windows, label_self_as_you)
+    verb_rows, npc_totals, _ = _compute_encounter_combat_breakdown(windows, label_self_as_you)
 
     # combatant -> direction -> [attack-type rows], per NPC
     by_npc_combatant: dict[str, dict[str, dict[str, list]]] = {}
@@ -3733,6 +3789,34 @@ def _build_encounter_breakdown_npcs(windows, label_self_as_you, split_you, durat
     return npcs
 
 
+def _build_encounter_damage_totals(totals_rows, duration_s):
+    """The merged-encounters counterpart to _build_encounter_breakdown_npcs:
+    same per-(combatant, verb, direction) rows, but summed across every NPC
+    into one outgoing/incoming total per combatant instead of one block per
+    mob -- for a "whole thing merged" view once several fights (or several
+    cherry-picked mobs) are combined and a per-mob breakdown isn't the
+    point."""
+    def by_direction(direction):
+        by_combatant: dict[str, list] = {}
+        for r in totals_rows:
+            if r["direction"] == direction:
+                by_combatant.setdefault(r["combatant"], []).append(r)
+        combatants = []
+        for name, attacks in by_combatant.items():
+            total_damage = sum(a["total_damage"] for a in attacks)
+            combatants.append({
+                "name": name,
+                "total_damage": total_damage,
+                "attempts": sum(a["attempts"] for a in attacks),
+                "dps": round(total_damage / duration_s, 1),
+                "attacks": sorted(attacks, key=lambda a: -a["total_damage"]),
+            })
+        combatants.sort(key=lambda c: -c["total_damage"])
+        return combatants
+
+    return {"out": by_direction("out"), "in": by_direction("in")}
+
+
 @app.get("/encounters/breakdown", response_class=HTMLResponse)
 def encounter_breakdown(request: Request, character: str, start_ts: str, stop_ts: str = ""):
     start_dt = datetime.fromisoformat(start_ts)
@@ -3745,6 +3829,7 @@ def encounter_breakdown(request: Request, character: str, start_ts: str, stop_ts
 
     return templates.TemplateResponse(request, "encounter_breakdown.html", {
         "npcs": npcs,
+        "damage_totals": None,
         "healers": healers,
         "merged": False,
         "windows": None,
@@ -3761,37 +3846,55 @@ def encounter_breakdown_merged(
     character: list[str] = Query(...),
     start_ts: list[str] = Query(...),
     stop_ts: list[str] = Query(default=[]),
+    npc: list[str] = Query(default=[]),
 ):
-    # Aligned by index -- one (character, start_ts, stop_ts) triple per
-    # selected encounter. Missing/blank stop_ts entries pad out to an
-    # open-ended window rather than erroring, same as the single-encounter
-    # route's default.
+    # Aligned by index -- one (character, start_ts, stop_ts, npc) tuple per
+    # selected item. Missing/blank stop_ts/npc entries pad out to an
+    # open-ended window / no-mob-filter respectively, same as the
+    # single-encounter route's stop_ts default. A blank npc means "the whole
+    # encounter"; a set npc means one specific mob was cherry-picked out of
+    # it (via the per-mob checkboxes on /encounters and /live).
     stop_ts = stop_ts + [""] * (len(character) - len(stop_ts))
+    npc = npc + [""] * (len(character) - len(npc))
     windows = [
-        {"character": c, "start_ts": s, "stop_ts": e or None}
-        for c, s, e in zip(character, start_ts, stop_ts)
+        {"character": c, "start_ts": s, "stop_ts": e or None, "npc": n or None}
+        for c, s, e, n in zip(character, start_ts, stop_ts, npc)
     ]
     if not windows:
         raise HTTPException(400, "at least one encounter is required")
 
-    # Combined duration is the sum of each selected encounter's own span,
-    # not the wall-clock distance between the first and last -- these are
+    # Damage is scoped per-selection (an npc-filtered window only lets that
+    # mob's rows through), but duration/healing aren't npc-scoped -- heals
+    # don't have a mob side, and two mob selections that share the same
+    # encounter time range shouldn't double-count that time. So duration and
+    # healing use the distinct (character, start, stop) ranges only, with
+    # any npc filters collapsed out.
+    seen_ranges = set()
+    unique_time_windows = []
+    for w in windows:
+        key = (w["character"], w["start_ts"], w["stop_ts"])
+        if key not in seen_ranges:
+            seen_ranges.add(key)
+            unique_time_windows.append({"character": w["character"], "start_ts": w["start_ts"], "stop_ts": w["stop_ts"]})
+
+    # Combined duration is the sum of each distinct range's own span, not
+    # the wall-clock distance between the first and last -- these are
     # disjoint fights merged together, and DPS should reflect only the time
     # actually spent in them.
     duration_s = 0.0
-    for w in windows:
+    for w in unique_time_windows:
         start_dt = datetime.fromisoformat(w["start_ts"])
         end_dt = datetime.fromisoformat(w["stop_ts"]) if w["stop_ts"] else datetime.now()
         duration_s += max((end_dt - start_dt).total_seconds(), 0.1)
     duration_s = max(round(duration_s), 1)
 
-    npcs = _build_encounter_breakdown_npcs(
-        windows, label_self_as_you=False, split_you=False, duration_s=duration_s,
-    )
-    healers = _build_encounter_healing(windows, label_self_as_you=False, duration_s=duration_s)
+    _, _, totals_rows = _compute_encounter_combat_breakdown(windows, label_self_as_you=False)
+    damage_totals = _build_encounter_damage_totals(totals_rows, duration_s)
+    healers = _build_encounter_healing(unique_time_windows, label_self_as_you=False, duration_s=duration_s)
 
     return templates.TemplateResponse(request, "encounter_breakdown.html", {
-        "npcs": npcs,
+        "npcs": [],
+        "damage_totals": damage_totals,
         "healers": healers,
         "merged": True,
         "windows": windows,

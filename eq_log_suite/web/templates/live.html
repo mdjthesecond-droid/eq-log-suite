@@ -310,27 +310,47 @@ imported log -- see <a href="/encounters">Encounters</a>.</p>
 
   // Selected-for-merge state survives loadEncounters()'s periodic full
   // rebuild of #encounters-list (keyed the same way as the merge/detail
-  // fetches: character|start_ts|stop_ts).
-  const selectedEncounters = new Map();
-  function encKey(character, startTs, stopTs) { return `${character}|${startTs}|${stopTs}`; }
+  // fetches: character|start_ts|stop_ts|npc). Holds both encounter-level
+  // picks (npc: "") and per-mob picks cherry-picked out of an expanded
+  // encounter (npc set) -- see wireMobSelect.
+  const selectedItems = new Map();
+  function itemKey(character, startTs, stopTs, npc) { return `${character}|${startTs}|${stopTs}|${npc || ""}`; }
 
   function updateMergeBar() {
-    const n = selectedEncounters.size;
+    const n = selectedItems.size;
     document.getElementById("merge-bar").style.display = n >= 2 ? "" : "none";
-    document.getElementById("merge-count").textContent = `${n} encounter(s) selected`;
+    document.getElementById("merge-count").textContent = `${n} item(s) selected`;
+  }
+  // Mutual exclusion, mob-checkbox side: picking a mob clears the
+  // encounter-level checkbox for its row (merging both would double-count
+  // that mob's damage). Wired onto checkboxes built fresh in loadEncounters().
+  function wireMobSelect(checkbox, encKeyParams, mobParams) {
+    const encKey = itemKey(encKeyParams.character, encKeyParams.start_ts, encKeyParams.stop_ts, "");
+    const mobKey = itemKey(mobParams.character, mobParams.start_ts, mobParams.stop_ts, mobParams.npc);
+    checkbox.checked = selectedItems.has(mobKey);
+    checkbox.addEventListener("change", () => {
+      if (checkbox.checked) {
+        selectedItems.set(mobKey, mobParams);
+        selectedItems.delete(encKey);
+      } else {
+        selectedItems.delete(mobKey);
+      }
+      updateMergeBar();
+    });
   }
   document.getElementById("merge-btn").addEventListener("click", () => {
     const params = new URLSearchParams();
-    for (const w of selectedEncounters.values()) {
+    for (const w of selectedItems.values()) {
       params.append("character", w.character);
       params.append("start_ts", w.start_ts);
       params.append("stop_ts", w.stop_ts);
+      params.append("npc", w.npc || "");
     }
     window.open(`/encounters/breakdown/merged?${params}`, "_blank");
   });
   document.getElementById("merge-clear").addEventListener("click", () => {
-    selectedEncounters.clear();
-    document.querySelectorAll(".enc-select").forEach((cb) => { cb.checked = false; });
+    selectedItems.clear();
+    document.querySelectorAll(".enc-select, .mob-select").forEach((cb) => { cb.checked = false; });
     updateMergeBar();
   });
 
@@ -346,20 +366,28 @@ imported log -- see <a href="/encounters">Encounters</a>.</p>
     for (const e of encounters) {
       if (e.active) continue;  // shown in the Active Encounter box instead
       const details = document.createElement("details");
-      const key = encKey(e.character, e.start_ts, e.stop_ts);
+      const encParams = { character: e.character, start_ts: e.start_ts, stop_ts: e.stop_ts, npc: "" };
+      const key = itemKey(e.character, e.start_ts, e.stop_ts, "");
       const summary = document.createElement("summary");
 
       const checkbox = document.createElement("input");
       checkbox.type = "checkbox";
       checkbox.className = "enc-select";
       checkbox.title = "select to merge with other encounters";
-      checkbox.checked = selectedEncounters.has(key);
+      checkbox.checked = selectedItems.has(key);
       checkbox.addEventListener("click", (ev) => ev.stopPropagation());
       checkbox.addEventListener("change", () => {
         if (checkbox.checked) {
-          selectedEncounters.set(key, { character: e.character, start_ts: e.start_ts, stop_ts: e.stop_ts });
+          selectedItems.set(key, encParams);
+          // Whole-encounter and per-mob selection are mutually exclusive for
+          // the same encounter -- see wireMobSelect for the other direction.
+          const prefix = `${e.character}|${e.start_ts}|${e.stop_ts}|`;
+          for (const k of [...selectedItems.keys()]) {
+            if (k !== key && k.startsWith(prefix)) selectedItems.delete(k);
+          }
+          details.querySelectorAll(".mob-select").forEach((mcb) => { mcb.checked = false; });
         } else {
-          selectedEncounters.delete(key);
+          selectedItems.delete(key);
         }
         updateMergeBar();
       });
@@ -406,19 +434,23 @@ imported log -- see <a href="/encounters">Encounters</a>.</p>
           return;
         }
         const table = document.createElement("table");
-        table.innerHTML = "<thead><tr><th>mob</th><th>dmg out</th><th>dmg in</th>" +
+        table.innerHTML = "<thead><tr><th></th><th>mob</th><th>dmg out</th><th>dmg in</th>" +
           "<th>my hit%</th><th>my crit%</th><th>their hit%</th><th>their crit%</th>" +
           "<th>my evasion%</th><th>their resist%</th><th>my DS dmg</th><th>their DS dmg</th>" +
           "<th>contributors (dmg out)</th></tr></thead><tbody>" + mobs.map(m => {
             const contribText = (m.contributors || [])
               .map(c => `${esc(c.name)}: ${c.damage_out.toLocaleString()}`).join(", ");
-            return `<tr><td>${esc(m.mob)}</td><td>${m.damage_out.toLocaleString()}</td><td>${m.damage_in.toLocaleString()}</td>` +
+            return `<tr><td><input type="checkbox" class="mob-select" data-mob="${esc(m.mob)}" title="select just ${esc(m.mob)} to merge with other encounters/mobs"></td>` +
+              `<td>${esc(m.mob)}</td><td>${m.damage_out.toLocaleString()}</td><td>${m.damage_in.toLocaleString()}</td>` +
               `<td>${fmtPct(m.hit_pct)}</td><td>${fmtPct(m.crit_pct)}</td>` +
               `<td>${fmtPct(m.their_hit_pct)}</td><td>${fmtPct(m.their_crit_pct)}</td>` +
               `<td>${fmtPct(m.evasion_pct)}</td><td>${fmtPct(m.resist_pct)}</td>` +
               `<td>${m.ds_out.toLocaleString()}</td><td>${m.ds_in.toLocaleString()}</td>` +
               `<td style="font-size:0.85rem;">${contribText}</td></tr>`;
           }).join("") + "</tbody>";
+        table.querySelectorAll(".mob-select").forEach((cb) => {
+          wireMobSelect(cb, encParams, { character: e.character, start_ts: e.start_ts, stop_ts: e.stop_ts, npc: cb.dataset.mob });
+        });
         body.appendChild(table);
       });
       container.appendChild(details);
