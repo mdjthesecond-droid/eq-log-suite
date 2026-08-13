@@ -351,16 +351,21 @@ def _compute_loot(game, npc="", item="", zone=""):
     # /loot used to render the *entire* zone->npc->item drop table
     # unconditionally (~0.7s of correlated zone lookups over every loot/
     # death event, every single page load) now that /zoneinfo covers
-    # per-zone browsing and each NPC's own page covers per-npc browsing --
-    # this is search-only now (see the two routes below, which just don't
-    # call this at all with no filters given). npc/item filters are pushed
-    # into loot_events' WHERE (not a post-aggregation HAVING) so a real
-    # search also does meaningfully less correlated zone-lookup work, not
-    # just skip the no-filter case: e.g. searching one item name only
-    # correlates zone for the handful of loot rows matching that name, not
-    # all ~1800. kills is restricted to just the npcs loot_events actually
-    # produced, for the same reason -- chance% never needs a kill count for
-    # an npc with no matching loot row.
+    # per-zone browsing and each NPC's own page covers per-npc browsing.
+    # It now always runs (see the two routes below), capped at
+    # LOOT_RESULT_LIMIT rows -- but that cap is applied only after grouping,
+    # so it doesn't bound the real cost driver: correlating each loot/kill
+    # row to "whichever zone_change happened most recently before it".
+    # That correlation used to be _base_zone_expr(), a SQL correlated
+    # subquery evaluated once per row -- fine at a few thousand rows, but
+    # confirmed real (2026-08-13): with ~8400 loot events + ~3100 kills
+    # after a loot-parser backfill added ~1700 rows, /loot took 86s to
+    # load. Same root cause as [[feedback-correlated-subquery-per-row-not-per-group]]
+    # (MariaDB doesn't materialize/index this well per-row), so it gets the
+    # same fix already used elsewhere in this file (see the con/death
+    # tier-lookup a few hundred lines down): fetch the small zone_change
+    # table once per character and do the "most recent prior row" lookup
+    # in Python with bisect instead of in SQL.
     #
     # Future extension point: once items have a curated type (trash/quest/
     # tradeskill/weapon slot+type/armor slot+type -- not built yet), that'd
@@ -373,69 +378,102 @@ def _compute_loot(game, npc="", item="", zone=""):
     if item:
         loot_clauses.append("ev.target_name LIKE %s"); loot_params.append(f"%{item}%")
 
-    zone_where = ""
-    zone_params = []
-    if zone:
-        # zone comes from _base_zone_expr(), a JSON_UNQUOTE(JSON_EXTRACT(...))
-        # expression -- MariaDB gives those utf8mb4_bin collation (binary,
-        # case-sensitive) regardless of the source column's own collation,
-        # unlike npc/item above which stay on source_name/target_name's
-        # native case-insensitive collation. LOWER() on both sides restores
-        # the same case-insensitive matching as every other search field.
-        zone_where = "WHERE LOWER(zone) LIKE %s"
-        zone_params = [f"%{zone.lower()}%"]
+    conn = db.get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT ev.character_id, ev.ts, ev.source_name AS npc, "
+                "ev.target_name AS item, ev.amount AS qty "
+                "FROM events ev JOIN games g ON ev.game_id=g.id "
+                f"WHERE {' AND '.join(loot_clauses)}",
+                loot_params,
+            )
+            loot_rows = cur.fetchall()
 
-    sql = (
-        # Drop chance needs kills as the denominator -- not every kill drops
-        # anything, so "how often does X drop" only means something relative
-        # to "how many times did I kill it". Unlike gathering, loot quantity
-        # isn't a small set of fixed tiers -- just average it per (zone, npc, item).
-        # zone isn't stated on the loot/death line itself -- correlate against
-        # the most recent zone_change for that character. Uses base_zone
-        # (_base_zone_expr, same as /zoneinfo), not the raw tiered string
-        # (_ZONE_LOOKUP_EXPR, used by /gathering/EQ2-quests) -- results here
-        # link out to /zoneinfo/{game}/detail?zone=..., which is keyed on
-        # base zone, so this has to match or the links would 404. Kills are
-        # correlated to zone too (a null-safe join, <=>, since a kill/drop
-        # before any zone_change is logged has zone=NULL).
-        "WITH loot_events AS ("
-        "  SELECT ev.source_name AS npc, ev.target_name AS item, ev.amount AS qty, "
-        f"         {_base_zone_expr()} AS zone "
-        "  FROM events ev JOIN games g ON ev.game_id=g.id JOIN characters c ON ev.character_id=c.id "
-        f"  WHERE {' AND '.join(loot_clauses)}"
-        "), loot_grouped AS ("
-        "  SELECT npc, zone, item, ROUND(AVG(qty), 1) AS avg_qty, COUNT(*) AS drops "
-        "  FROM loot_events GROUP BY npc, zone, item"
-        "), kills AS ("
-        "  SELECT ev.target_name AS npc, "
-        f"         {_base_zone_expr()} AS zone, "
-        "         COUNT(*) AS kill_count "
-        "  FROM events ev JOIN games g ON ev.game_id=g.id JOIN characters c ON ev.character_id=c.id "
-        "  WHERE ev.event_type='death' AND ev.source_type='you' AND g.code = %s "
-        "    AND ev.target_name IN (SELECT DISTINCT npc FROM loot_events) "
-        "  GROUP BY ev.target_name, zone"
-        ") "
-        "SELECT * FROM ("
-        "  SELECT lg.zone, lg.npc, lg.item, lg.avg_qty, lg.drops, k.kill_count, "
-        "  ROUND(lg.drops / k.kill_count * 100, 2) AS chance_pct "
-        "  FROM loot_grouped lg LEFT JOIN kills k ON k.npc = lg.npc AND k.zone <=> lg.zone"
-        ") t "
-        f"{zone_where} ORDER BY item, chance_pct DESC "
-        "LIMIT %s"
-    )
+            # Drop chance needs kills as the denominator -- not every kill
+            # drops anything, so "how often does X drop" only means
+            # something relative to "how many times did I kill it". Not
+            # narrowed to loot_rows' npcs here (that filtering happened in
+            # SQL before, as a cheap `IN`) -- with only ~3000 rows total,
+            # fetching all of them and letting the dict lookups below
+            # simply go unused for npcs with no loot match is simpler and
+            # not meaningfully slower.
+            cur.execute(
+                "SELECT ev.character_id, ev.ts, ev.target_name AS npc "
+                "FROM events ev JOIN games g ON ev.game_id=g.id "
+                "WHERE ev.event_type='death' AND ev.source_type='you' AND g.code=%s",
+                (game,),
+            )
+            kill_rows = cur.fetchall()
+
+            cur.execute(
+                "SELECT ev.character_id, ev.ts, "
+                "JSON_UNQUOTE(JSON_EXTRACT(ev.extra,'$.base_zone')) AS zone "
+                "FROM events ev JOIN games g ON ev.game_id=g.id "
+                "WHERE ev.event_type='zone_change' AND g.code=%s ORDER BY ev.character_id, ev.ts",
+                (game,),
+            )
+            zone_changes = cur.fetchall()
+    finally:
+        conn.close()
+
+    # Same "most recent zone_change at or before ts, per character" lookup
+    # as _base_zone_expr, done once here instead of as a correlated SQL
+    # subquery -- see the comment above for why.
+    zc_by_char: dict = {}
+    for r in zone_changes:
+        zc = zc_by_char.setdefault(r["character_id"], {"ts": [], "zone": []})
+        zc["ts"].append(r["ts"])
+        zc["zone"].append(r["zone"])
+
+    def zone_at(character_id, ts):
+        zc = zc_by_char.get(character_id)
+        if not zc:
+            return None
+        i = bisect.bisect_right(zc["ts"], ts) - 1
+        return zc["zone"][i] if i >= 0 else None
+
+    for r in loot_rows:
+        r["zone"] = zone_at(r["character_id"], r["ts"])
+    for r in kill_rows:
+        r["zone"] = zone_at(r["character_id"], r["ts"])
+
+    loot_grouped: dict = {}
+    for r in loot_rows:
+        key = (r["npc"], r["zone"], r["item"])
+        g = loot_grouped.setdefault(key, {"qtys": [], "drops": 0})
+        g["qtys"].append(r["qty"] if r["qty"] is not None else 1)
+        g["drops"] += 1
+
+    kill_counts: dict = {}
+    for r in kill_rows:
+        key = (r["npc"], r["zone"])
+        kill_counts[key] = kill_counts.get(key, 0) + 1
+
+    rows = []
+    for (npc_, zone_, item_), g in loot_grouped.items():
+        kill_count = kill_counts.get((npc_, zone_))
+        rows.append({
+            "zone": zone_, "npc": npc_, "item": item_,
+            "avg_qty": round(sum(g["qtys"]) / len(g["qtys"]), 1),
+            "drops": g["drops"],
+            "kill_count": kill_count,
+            "chance_pct": round(g["drops"] / kill_count * 100, 2) if kill_count else None,
+        })
+
+    if zone:
+        needle = zone.lower()
+        rows = [r for r in rows if needle in (r["zone"] or "").lower()]
+
+    # NULLs (no kill_count) sort last, same as MariaDB's DESC-puts-NULL-last
+    # behavior in the SQL version this replaced.
+    rows.sort(key=lambda r: (r["item"] or "", r["chance_pct"] is None, -(r["chance_pct"] or 0)))
+    truncated = len(rows) > LOOT_RESULT_LIMIT
+    rows = rows[:LOOT_RESULT_LIMIT]
 
     conn = db.get_connection()
     try:
         with conn.cursor() as cur:
-            # Fetch one row past the limit just to detect truncation, then
-            # trim it back off below -- lets a wide-open, no-filter search
-            # (npc/item/zone all blank) stay cheap instead of materializing
-            # every loot row in the game.
-            cur.execute(sql, loot_params + [game] + zone_params + [LOOT_RESULT_LIMIT + 1])
-            rows = cur.fetchall()
-            truncated = len(rows) > LOOT_RESULT_LIMIT
-            rows = rows[:LOOT_RESULT_LIMIT]
-
             # Level (from /con) as appropriate, per npc -- same source as
             # each NPC's own page, just fetched once here rather than
             # correlated per loot row. Matched case-insensitively: classic
