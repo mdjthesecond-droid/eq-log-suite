@@ -788,6 +788,33 @@ def _classify_label(raw_label: str) -> tuple[str, str]:
 _NON_NUMERIC_STAT_LABELS = {"Size", "Skill"}
 _LEADING_NUMBER_RE = re.compile(r"^\s*(-?\d+(?:\.\d+)?)")
 
+# "Intelligence" is the longest stat label -- confirmed real across many
+# captures (2026-08-13) that OCR consistently drops its colon entirely
+# (least trailing gap before the next column's text of any label), so the
+# colon-anchored _LABEL_VALUE_RE never matches it and it silently never
+# reaches the review form at all: "Intelligence2", "Intelligence4 SV. Fire:
+# 5", "IntelligenceZz SV. Void: 2", "Intelligenc#2 SV. Void: 4", and bare
+# "Intelligence" with the value gone outright. Recovered as a dedicated
+# fallback (only when the normal sweep found nothing) rather than folded
+# into _LABEL_VALUE_RE, since the missing colon means there's no reliable
+# "label ends here" boundary to anchor a single generic pattern on.
+_INTELLIGENCE_GARBLE_RE = re.compile(r"\bIntelligenc[a-zA-Z]*", re.IGNORECASE)
+_LEADING_VALUE_GARBLE_RE = re.compile(r"^[^0-9A-Za-z]{0,3}(\d+)")
+
+
+def _fill_garbled_intelligence(block_text: str, buckets: dict) -> None:
+    """Adds an Intelligence stat row -- with whatever value digit can be
+    salvaged, or blank -- so the review form always surfaces it for the
+    human to fill in/confirm instead of the field just being absent.
+    Only called when the normal sweep didn't already find Intelligence."""
+    for line in block_text.splitlines():
+        m = _INTELLIGENCE_GARBLE_RE.search(line)
+        if not m:
+            continue
+        vm = _LEADING_VALUE_GARBLE_RE.match(line[m.end():])
+        buckets["stat"]["Intelligence"] = vm.group(1) if vm else ""
+        return
+
 
 def _extract_fields(block_text: str) -> dict:
     """Sweeps a block's text for every 'Label: Value' pair and classifies
@@ -808,6 +835,8 @@ def _extract_fields(block_text: str) -> dict:
                     value = m2.group(1)
             if value:
                 buckets[bucket][label] = value
+    if "Intelligence" not in buckets["stat"]:
+        _fill_garbled_intelligence(block_text, buckets)
     return buckets
 
 
@@ -2512,6 +2541,44 @@ def _compute_zone_detail(game, zone, tier="all", solo="any"):
             reward_rows = cur.fetchall()
             quest_items = [r for r in reward_rows if r["item"] and not _CURRENCY_TEXT_RE.match(r["item"])]
 
+            # Completed item turn-ins (item_offer -> trade_complete pairs) --
+            # a different signal from the reward-based quest_items above.
+            # trade_complete carries no info about what was given, only that
+            # an offer succeeded, so items are paired back to whichever
+            # item_offer row(s) immediately preceded it for the same NPC
+            # (same pairing shape as _compute_dialogue). Confirmed real
+            # (Plane of Sky, 2026-08-13): dozens of completed Wind Rune/
+            # artifact exchanges with no `reward` event at all -- the
+            # reward-only quest_items query above silently missed every one
+            # of these, which is what a user noticed as "completed more
+            # quests than the loot list accounts for".
+            cur.execute(
+                "SELECT ev.event_type AS kind, ev.ts, ev.target_name AS npc, "
+                "JSON_UNQUOTE(JSON_EXTRACT(ev.extra,'$.item')) AS item "
+                "FROM events ev JOIN games g ON ev.game_id=g.id "
+                f"WHERE ev.event_type IN ('item_offer','trade_complete') AND g.code=%s AND {match_where} "
+                "ORDER BY ev.ts",
+                [game] + match_params,
+            )
+            trade_events = cur.fetchall()
+            pending_offers = {}
+            completed_trades = []
+            for r in trade_events:
+                if r["kind"] == "item_offer":
+                    pending_offers.setdefault(r["npc"], []).append(r["item"])
+                else:
+                    items = pending_offers.pop(r["npc"], [])
+                    if items:
+                        # Not "items" -- Jinja's dot-lookup on a dict tries
+                        # getattr() before __getitem__, and dict already has
+                        # a real .items() method, so `t.items` in the
+                        # template silently resolves to that bound method
+                        # instead of this key (confirmed real: 500 error,
+                        # "'builtin_function_or_method' object is not
+                        # iterable" from the |join filter).
+                        completed_trades.append({"ts": r["ts"], "npc": r["npc"], "items_given": items})
+            completed_trades.sort(key=lambda t: t["ts"], reverse=True)
+
             # rare mobs seen here, cross-referenced with their own drops
             # (from the loot rows already fetched above) per the user's
             # explicit ask to be able to check a rare's drops at a glance.
@@ -2544,6 +2611,7 @@ def _compute_zone_detail(game, zone, tier="all", solo="any"):
         "loot": loot,
         "ground_spawns": ground_spawns,
         "quest_items": quest_items,
+        "completed_trades": completed_trades,
         "rares": rares,
         "override": override,
     }

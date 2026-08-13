@@ -158,4 +158,17 @@ for the full dialogue transcript with each NPC).</p>
   </tbody>
 </table>
 {% else %}<p>None yet.</p>{% endif %}
+
+<h2>Completed trades / turn-ins here</h2>
+<p style="opacity:0.7;">Items you handed over to an NPC that completed a trade (e.g. Plane of Sky's Wind Rune
+exchanges) -- a separate signal from the reward list above, since a completed trade doesn't always pay out
+via a logged reward.</p>
+{% if completed_trades %}
+<table class="sortable">
+  <thead><tr><th>ts</th><th>npc</th><th>items given</th></tr></thead>
+  <tbody>
+    {% for t in completed_trades %}<tr><td>{{ t.ts }}</td><td><a href="/quests/{{ game }}?npc={{ t.npc|urlencode }}">{{ t.npc }}</a></td><td>{{ t.items_given|join(', ') }}</td></tr>{% endfor %}
+  </tbody>
+</table>
+{% else %}<p>None yet.</p>{% endif %}
 {% endblock %}

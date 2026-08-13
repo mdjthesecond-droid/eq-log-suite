@@ -817,6 +817,21 @@ class EQLegendsParser(GameParser):
             r"^You looted (?:(?P<qty>\d+) )?(?P<item>.+?) from (?P<source>.+?)'s corpse"
         ), h_loot),
 
+        # "--You have looted a Pulsating Ruby from Bazzt Zzzt's corpse.--" /
+        # "--You have looted 2 Blood Spirit from a hemo enologist's corpse.--"
+        # -- a second, entirely distinct loot message shape (dash-bracketed,
+        # "have looted" not "looted"), confirmed real: 1699 real occurrences
+        # in one log alongside 6269 of the plain "You looted ..." shape
+        # above, same days/times, ~21% of all loot lines -- not an old
+        # format that got replaced, both are still in active use. Missed by
+        # the pattern above entirely (different verb, different anchor), so
+        # every item looted this way was silently absent from every loot
+        # report -- caught only because the user grepped their own log for
+        # an item they knew they'd looted and it wasn't showing up.
+        (re.compile(
+            r"^--You have looted (?:(?P<qty>\d+) )?(?P<item>.+?) from (?P<source>.+?)'s corpse\.--$"
+        ), h_loot),
+
         # "You picked up Gloomingdeep Mushrooms." -- must come after h_loot's
         # "You looted ..." pattern above so a real loot line (a different
         # sentence shape entirely, but both start with "You") never risks
