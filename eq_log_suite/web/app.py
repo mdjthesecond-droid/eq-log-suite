@@ -1044,14 +1044,41 @@ def _split_item_blocks(ocr_text: str | None) -> list[dict]:
     return blocks
 
 
+# Classes seen in real Class field values (see item_info.stats), for the
+# /items class filter dropdown -- excludes "ALL" (every class can use
+# those, so they're included in every class's results automatically below
+# rather than being a selectable class of their own) and "None"
+# (non-equippable items, e.g. tradeskill materials, have nothing to filter
+# by class-usability on).
+_ITEMS_CLASS_OPTIONS = (
+    "WAR", "CLR", "PAL", "RNG", "SHD", "DRU", "MNK", "BRD",
+    "ROG", "SHM", "NEC", "WIZ", "MAG", "ENC", "BST", "BER",
+)
+# "Bigger is better" numeric stats worth filtering/sorting a loadout search
+# by -- deliberately excludes Size/Weight/Delay/Ratio/Skill (not a "more is
+# better" axis) even though they're in _STAT_LABELS above.
+_ITEMS_STAT_OPTIONS = (
+    "AC", "HP", "Mana", "Endurance", "Haste",
+    "Strength", "Stamina", "Agility", "Dexterity", "Wisdom", "Intelligence", "Charisma",
+    "SV. Fire", "SV. Cold", "SV. Magic", "SV. Poison", "SV. Disease", "SV. Void",
+)
+
+
 @app.get("/items", response_class=HTMLResponse)
-def items_list(request: Request, search: str = ""):
+def items_list(request: Request, search: str = "", cls: str = "", stat: str = "", min_stat: str = ""):
     # One row per *base item* (tier variants of the same item -- "Coif" /
     # "Coif +1" / ... -- grouped together, see _base_item_name), showing the
     # lowest tier/progress snapshot by default rather than the most recent
     # confirm. item_info stays an append-only history underneath; full
     # per-tier browsing is on /items/detail's dropdown, and pure re-confirm
     # drift auditing for one exact tier is on /items/history.
+    #
+    # Known limitation of the class/stat filters below: since each row is
+    # already pinned to its family's lowest tier (the existing convention
+    # above, unchanged), a min-stat filter only sees that lowest-tier value
+    # -- an item that only clears the threshold at a higher tier won't show
+    # here. Good enough for "what's worth chasing at all", not a substitute
+    # for checking /items/detail's tier dropdown on a specific candidate.
     conn = db.get_connection()
     try:
         with conn.cursor() as cur:
@@ -1081,8 +1108,33 @@ def items_list(request: Request, search: str = ""):
         needle = search.lower()
         rows = [r for r in rows if needle in r["base_name"].lower()]
 
+    if cls:
+        rows = [r for r in rows if cls in r["stats"].get("Class", []) or "ALL" in r["stats"].get("Class", [])]
+
+    if stat:
+        min_val = None
+        if min_stat.strip():
+            try:
+                min_val = float(min_stat)
+            except ValueError:
+                pass
+        filtered = []
+        for r in rows:
+            try:
+                v = float(r["stats"].get(stat))
+            except (TypeError, ValueError):
+                continue
+            if min_val is not None and v < min_val:
+                continue
+            r["stat_value"] = v
+            filtered.append(r)
+        rows = filtered
+        rows.sort(key=lambda r: r["stat_value"], reverse=True)
+
     return templates.TemplateResponse(request, "items.html", {
         "rows": rows, "search": search, "pending_count": pending_count,
+        "cls": cls, "stat": stat, "min_stat": min_stat,
+        "class_options": _ITEMS_CLASS_OPTIONS, "stat_options": _ITEMS_STAT_OPTIONS,
     })
 
 
