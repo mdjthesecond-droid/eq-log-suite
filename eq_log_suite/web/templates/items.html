@@ -23,6 +23,14 @@ boundary), and known drop sources.</p>
     <option value="">any class</option>
     {% for c in class_options %}<option value="{{ c }}" {{ 'selected' if cls == c }}>{{ c }}</option>{% endfor %}
   </select>
+  <select name="slot">
+    <option value="">any slot</option>
+    {% for s in slot_options %}<option value="{{ s }}" {{ 'selected' if slot == s }}>{{ s }}</option>{% endfor %}
+  </select>
+  <select name="skill">
+    <option value="">any skill</option>
+    {% for value, label in skill_options %}<option value="{{ value }}" {{ 'selected' if skill == value }}>{{ label }}</option>{% endfor %}
+  </select>
   <select name="stat">
     <option value="">any stat</option>
     {% for s in stat_options %}<option value="{{ s }}" {{ 'selected' if stat == s }}>{{ s }}</option>{% endfor %}

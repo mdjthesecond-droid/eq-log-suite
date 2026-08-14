@@ -1092,10 +1092,31 @@ _ITEMS_STAT_OPTIONS = (
     "Strength", "Stamina", "Agility", "Dexterity", "Wisdom", "Intelligence", "Charisma",
     "SV. Fire", "SV. Cold", "SV. Magic", "SV. Poison", "SV. Disease", "SV. Void",
 )
+# Every Slot value confirmed real across item_info so far (2026-08-13) --
+# unlike class/stat, this is a plain equipment-slot vocabulary with no
+# "ALL"-style wildcard to special-case.
+_ITEMS_SLOT_OPTIONS = (
+    "Primary", "Secondary", "Head", "Face", "Neck", "Shoulders", "Chest",
+    "Arms", "Wrist", "Hands", "Fingers", "Waist", "Legs", "Feet", "Back", "Ear",
+)
+# Every Skill value confirmed real so far -- deliberately not a guess at
+# classic EQ's full weapon-skill list (1H Slashing/Piercing/Archery/... may
+# well exist on items not captured yet); add to this once one shows up in a
+# real capture, same policy as everywhere else in this file.
+# (value, dropdown label) pairs -- stored/filtered value stays "Hand to
+# Hand" (matches the real in-game field text, see _fill_garbled_skill), but
+# the dropdown shows the shorthand "H2H" per the user's request.
+_ITEMS_SKILL_OPTIONS = (
+    ("1H Blunt", "1H Blunt"), ("2H Blunt", "2H Blunt"), ("2H Slashing", "2H Slashing"),
+    ("Hand to Hand", "H2H"),
+)
 
 
 @app.get("/items", response_class=HTMLResponse)
-def items_list(request: Request, search: str = "", cls: str = "", stat: str = "", min_stat: str = ""):
+def items_list(
+    request: Request, search: str = "", cls: str = "", stat: str = "", min_stat: str = "",
+    slot: str = "", skill: str = "",
+):
     # One row per *base item* (tier variants of the same item -- "Coif" /
     # "Coif +1" / ... -- grouped together, see _base_item_name), showing the
     # lowest tier/progress snapshot by default rather than the most recent
@@ -1141,6 +1162,15 @@ def items_list(request: Request, search: str = "", cls: str = "", stat: str = ""
     if cls:
         rows = [r for r in rows if cls in r["stats"].get("Class", []) or "ALL" in r["stats"].get("Class", [])]
 
+    if slot:
+        rows = [r for r in rows if slot in r["stats"].get("Slot", [])]
+
+    if skill:
+        # Case-insensitive -- confirmed real data has both "Hand to Hand"
+        # (this parser's canonical casing) and a stray manually-typed
+        # "hand to hand" from before the garble fix existed.
+        rows = [r for r in rows if (r["stats"].get("Skill") or "").lower() == skill.lower()]
+
     if stat:
         min_val = None
         if min_stat.strip():
@@ -1163,8 +1193,9 @@ def items_list(request: Request, search: str = "", cls: str = "", stat: str = ""
 
     return templates.TemplateResponse(request, "items.html", {
         "rows": rows, "search": search, "pending_count": pending_count,
-        "cls": cls, "stat": stat, "min_stat": min_stat,
+        "cls": cls, "stat": stat, "min_stat": min_stat, "slot": slot, "skill": skill,
         "class_options": _ITEMS_CLASS_OPTIONS, "stat_options": _ITEMS_STAT_OPTIONS,
+        "slot_options": _ITEMS_SLOT_OPTIONS, "skill_options": _ITEMS_SKILL_OPTIONS,
     })
 
 
