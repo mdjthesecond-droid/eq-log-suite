@@ -854,6 +854,34 @@ def _fill_garbled_intelligence(block_text: str, buckets: dict) -> None:
         return
 
 
+# "Skill" is the other stat label that loses its colon to OCR (see the
+# Intelligence note above for the general failure mode) -- but unlike
+# Intelligence, Skill's value is text (a weapon skill type: "Hand to Hand",
+# "1H Blunt", ...), not a digit, so there's no leading-digit trick to fall
+# back on. Confirmed real ("Wu's Fist of Mastery" and others): "SkilHand to
+# Hand Dmg Bon: 13" -- the trailing "l" and the colon both vanish, fusing
+# the label straight onto the value with zero separator. Recovered the same
+# way _LABEL_VALUE_RE finds any other value: read forward from the garbled
+# label until the next known label/save name (or end of line).
+_SKILL_GARBLE_RE = re.compile(
+    rf"\bSkil(?=[A-Z])(.+?)(?=(?:{_KNOWN_LABELS_ALT})\s*:|sv\.?\s*\w+\s*:|$)",
+    re.IGNORECASE,
+)
+
+
+def _fill_garbled_skill(block_text: str, buckets: dict) -> None:
+    """Adds a Skill stat row recovered from the fused "SkilHand to Hand..."
+    shape. Only called when the normal sweep didn't already find Skill."""
+    for line in block_text.splitlines():
+        m = _SKILL_GARBLE_RE.search(line)
+        if not m:
+            continue
+        value = m.group(1).strip()
+        if value:
+            buckets["stat"]["Skill"] = value
+        return
+
+
 def _extract_fields(block_text: str) -> dict:
     """Sweeps a block's text for every 'Label: Value' pair and classifies
     each into a bucket. Prefill only -- see items_review's rendering of
@@ -875,6 +903,8 @@ def _extract_fields(block_text: str) -> dict:
                 buckets[bucket][label] = value
     if "Intelligence" not in buckets["stat"]:
         _fill_garbled_intelligence(block_text, buckets)
+    if "Skill" not in buckets["stat"]:
+        _fill_garbled_skill(block_text, buckets)
     return buckets
 
 
