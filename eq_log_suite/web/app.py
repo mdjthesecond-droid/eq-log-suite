@@ -1100,14 +1100,16 @@ _ITEMS_SLOT_OPTIONS = (
     "Arms", "Wrist", "Hands", "Fingers", "Waist", "Legs", "Feet", "Back", "Ear",
 )
 # Every Skill value confirmed real so far -- deliberately not a guess at
-# classic EQ's full weapon-skill list (1H Slashing/Piercing/Archery/... may
-# well exist on items not captured yet); add to this once one shows up in a
-# real capture, same policy as everywhere else in this file.
-# (value, dropdown label) pairs -- stored/filtered value stays "Hand to
-# Hand" (matches the real in-game field text, see _fill_garbled_skill), but
-# the dropdown shows the shorthand "H2H" per the user's request.
+# classic EQ's full weapon-skill list; the user's given shorthand for the
+# rest of that list (1H/2H x Piercing/Slashing/Blunt -> 1HP/2HP/1HS/2HS/
+# 1HB/2HB, Hand to Hand -> H2H) is ready to use once one shows up in a real
+# capture, same "confirmed real before it's added" policy as everywhere
+# else in this file.
+# (value, dropdown label) pairs -- stored/filtered value stays the real
+# in-game field text (see _fill_garbled_skill), dropdown shows the user's
+# shorthand.
 _ITEMS_SKILL_OPTIONS = (
-    ("1H Blunt", "1H Blunt"), ("2H Blunt", "2H Blunt"), ("2H Slashing", "2H Slashing"),
+    ("1H Blunt", "1HB"), ("2H Blunt", "2HB"), ("2H Slashing", "2HS"),
     ("Hand to Hand", "H2H"),
 )
 
