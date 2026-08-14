@@ -864,22 +864,47 @@ def _fill_garbled_intelligence(block_text: str, buckets: dict) -> None:
 # way _LABEL_VALUE_RE finds any other value: read forward from the garbled
 # label until the next known label/save name (or end of line).
 _SKILL_GARBLE_RE = re.compile(
-    rf"\bSkil(?=[A-Z])(.+?)(?=(?:{_KNOWN_LABELS_ALT})\s*:|sv\.?\s*\w+\s*:|$)",
+    # (?-i:...) forces this one lookahead to stay case-sensitive despite
+    # the pattern's own IGNORECASE below -- without it, [A-Z] under
+    # IGNORECASE matches lowercase too, so this wrongly fires on "Skill"
+    # (the *correctly*-spelled label, handled by _SKILL_HTYPE_RE below) by
+    # matching its own leftover second "l" as if it were an uppercase value
+    # start (confirmed real: was capturing "lWH Slashing" instead of
+    # leaving "SkillWH Slashing" for the other fallback to handle).
+    rf"\bSkil(?-i:(?=[A-Z]))(.+?)(?=(?:{_KNOWN_LABELS_ALT})\s*:|sv\.?\s*\w+\s*:|$)",
     re.IGNORECASE,
 )
+# A second, distinct garble shape for the 1H/2H weapon skills (Blunt/
+# Slashing/Piercing) -- unlike Hand to Hand above, "Skill" here keeps both
+# L's (only the colon is lost), and the 1/2 digit right after it is what
+# gets mangled: sometimes preserved literally ("Skill2H Slashing"),
+# sometimes misread as "t" (confirmed real via the user checking the actual
+# item twice -- "SkilltH Piercing" on Crystalline Spear and "SkilltH
+# Slashing" on Bloodmoon are both real 1H weapons), sometimes an
+# unrecognized stray glyph ("SkillWH Slashing"), sometimes gone outright
+# ("SkillH Slashing"). Only "t" is confirmed to always mean "1" -- an
+# unrecognized gap or no gap at all is genuinely ambiguous between 1H/2H,
+# so those are left blank for the reviewer rather than guessed.
+_SKILL_HTYPE_RE = re.compile(
+    r"\bSkill(?P<gap>[A-Za-z0-9]{0,2}?)H\s+(?P<wtype>Blunt|Slashing|Piercing)\b",
+    re.IGNORECASE,
+)
+_SKILL_HTYPE_DIGIT = {"1": "1", "2": "2", "t": "1"}
 
 
 def _fill_garbled_skill(block_text: str, buckets: dict) -> None:
-    """Adds a Skill stat row recovered from the fused "SkilHand to Hand..."
-    shape. Only called when the normal sweep didn't already find Skill."""
+    """Adds a Skill stat row recovered from either garbled shape above.
+    Only called when the normal sweep didn't already find Skill."""
     for line in block_text.splitlines():
-        m = _SKILL_GARBLE_RE.search(line)
-        if not m:
-            continue
-        value = m.group(1).strip()
-        if value:
-            buckets["stat"]["Skill"] = value
-        return
+        if m := _SKILL_GARBLE_RE.search(line):
+            value = m.group(1).strip()
+            if value:
+                buckets["stat"]["Skill"] = value
+            return
+        if m := _SKILL_HTYPE_RE.search(line):
+            digit = _SKILL_HTYPE_DIGIT.get(m.group("gap").lower())
+            buckets["stat"]["Skill"] = f'{digit}H {m.group("wtype").title()}' if digit else ""
+            return
 
 
 def _extract_fields(block_text: str) -> dict:
