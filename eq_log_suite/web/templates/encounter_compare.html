@@ -9,7 +9,7 @@ the matching table on the other side too, so the same column (e.g. hit%) lines u
   {% for s in sides %}
   <div style="flex:1 1 0; min-width:0; border:1px solid var(--border); border-radius:6px; overflow:hidden;">
     <iframe class="compare-frame" style="width:100%; height:80vh; border:none; display:block;"
-      src="/encounters/breakdown?{{ {'character': s.character, 'start_ts': s.start_ts, 'stop_ts': s.stop_ts, 'npc': s.npc}|urlencode }}"></iframe>
+      src="/encounters/breakdown?{{ {'character': s.character, 'start_ts': s.start_ts, 'stop_ts': s.stop_ts, 'npc': s.npc, 'embed': '1'}|urlencode }}"></iframe>
   </div>
   {% endfor %}
 </div>

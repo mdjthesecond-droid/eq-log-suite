@@ -2955,7 +2955,7 @@ def _build_encounter_damage_totals(totals_rows, duration_s):
 
 
 @app.get("/encounters/breakdown", response_class=HTMLResponse)
-def encounter_breakdown(request: Request, character: str, start_ts: str, stop_ts: str = "", npc: str = ""):
+def encounter_breakdown(request: Request, character: str, start_ts: str, stop_ts: str = "", npc: str = "", embed: bool = False):
     start_dt = datetime.fromisoformat(start_ts)
     end_dt = datetime.fromisoformat(stop_ts) if stop_ts else datetime.now()
     duration_s = max(round((end_dt - start_dt).total_seconds()), 1)
@@ -2977,6 +2977,10 @@ def encounter_breakdown(request: Request, character: str, start_ts: str, stop_ts
         "stop_ts": stop_ts or end_dt.isoformat(timespec="seconds"),
         "duration_s": duration_s,
         "filters": {"character": character, "start_ts": start_ts, "stop_ts": stop_ts, "npc": npc},
+        # Suppresses base.html's nav -- set when loaded inside /encounters/compare's
+        # iframes, where a full nav banner per side just wastes vertical space and
+        # its links would navigate that iframe away from the breakdown.
+        "embed": embed,
     })
 
 
