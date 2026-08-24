@@ -2704,7 +2704,13 @@ def _compute_encounter_procs(windows):
     rune_buff_start nearby at all -- turned out to be a Focus-effect item
     "shimmers briefly" pulse, not a rune source, so deliberately not
     attributed to it) lands in an "Unknown source" bucket instead of being
-    dropped -- see the rune_gain branch below."""
+    dropped -- see the rune_gain branch below.
+
+    Runes do NOT stack (confirmed real, user): a new rune_buff_start while
+    one's already open overwrites it for a full-value reset rather than
+    adding to what's left, discarding any unused absorption on the old
+    one -- each instance's "ended_by" is 'overwritten' or 'faded'
+    accordingly (or None if still open at the window's end)."""
     if not windows:
         return {"procs": [], "rune_instances": []}
 
@@ -2788,11 +2794,24 @@ def _compute_encounter_procs(windows):
     for ev in rune_events:
         cid = ev["character_id"]
         if ev["event_type"] == "rune_buff_start":
-            if cid in open_by_char:  # defensive: two starts with no fade between them
-                rune_instances.append(open_by_char.pop(cid))
+            if cid in open_by_char:
+                # Confirmed real (2026-08-24, user): a rune does NOT stack
+                # -- a new application overwrites whatever's currently
+                # active for a full-value reset, discarding any absorption
+                # still left on the old one. Not a rare edge case, this is
+                # the normal mechanic. The old instance's absorption total
+                # is what it was actually granted, not what necessarily got
+                # used -- "magical skin absorbs the blow!" (outcome='absorb')
+                # carries no point value in its text, so how much of that
+                # total was actually consumed vs. discarded on overwrite
+                # isn't knowable from the log.
+                prev = open_by_char.pop(cid)
+                prev["end_ts"] = ev["ts"]
+                prev["ended_by"] = "overwritten"
+                rune_instances.append(prev)
             open_by_char[cid] = {
                 "tier": ev["tier"], "start_ts": ev["ts"], "end_ts": None,
-                "gain_count": 0, "total": 0,
+                "gain_count": 0, "total": 0, "ended_by": None,
             }
         elif ev["event_type"] == "rune_gain":
             inst = open_by_char.get(cid)
@@ -2809,7 +2828,7 @@ def _compute_encounter_procs(windows):
                 # dropped, so the real point total isn't silently lost.
                 inst = open_by_char.setdefault(cid, {
                     "tier": "Unknown source", "start_ts": ev["ts"], "end_ts": None,
-                    "gain_count": 0, "total": 0,
+                    "gain_count": 0, "total": 0, "ended_by": None,
                 })
             inst["gain_count"] += 1
             inst["total"] += ev["amount"] or 0
@@ -2817,6 +2836,7 @@ def _compute_encounter_procs(windows):
             inst = open_by_char.pop(cid, None)
             if inst is not None:
                 inst["end_ts"] = ev["ts"]
+                inst["ended_by"] = "faded"
                 rune_instances.append(inst)
     rune_instances.extend(open_by_char.values())  # still active at window end
 

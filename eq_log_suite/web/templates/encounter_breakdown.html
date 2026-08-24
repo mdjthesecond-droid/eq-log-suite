@@ -218,7 +218,12 @@
   {% for r in rune_instances %}
   <tr><td style="opacity:0.7; padding-right:1rem;">{{ r.tier }}</td>
       <td>{{ r.total }} points absorption{% if r.gain_count > 1 %} ({{ r.gain_count }} top-ups){% endif %}</td>
-      <td style="opacity:0.7;">-- {% if r.duration_s is not none %}{{ r.duration_s }}s uptime{% else %}still active{% endif %}</td></tr>
+      <td style="opacity:0.7;">
+        --
+        {%- if r.duration_s is not none %} {{ r.duration_s }}s uptime
+          {%- if r.ended_by == 'overwritten' %} (overwritten by a new rune){% endif -%}
+        {%- else %} still active{% endif -%}
+      </td></tr>
   {% endfor %}
 </table>
 {% endif %}
