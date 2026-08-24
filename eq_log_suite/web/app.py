@@ -1118,33 +1118,35 @@ def _tier_solo_exprs(alias="ev"):
 
 
 def _compute_zone_list(game):
-    # Computes base_zone once per matching con/npc_dialogue row (via a
-    # single GROUP BY query) rather than once per (zone, row) pair via a
-    # per-zone loop -- the previous per-zone-loop version measured ~33s for
-    # 50 zones (each zone re-scanning and re-correlating every con/dialogue
-    # row from scratch); this version is under a second. See
-    # _compute_zone_connections's docstring for the same lesson applied to
-    # the gate-exclusion check.
+    # base_zone is resolved via a single bulk zone_change fetch + Python
+    # bisect (per character), not a correlated SQL subquery per row
+    # (_base_zone_expr()) -- confirmed real (2026-08-24): with ~2.7M eql
+    # events, the _base_zone_expr() version of this function took ~48s
+    # (37s of that in the npc_by_zone query alone, measured via
+    # SHOW PROCESSLIST). Same root cause and fix as
+    # [[feedback-correlated-subquery-per-row-not-per-group]], already
+    # applied to /loot -- see that function's comment for the pattern this
+    # mirrors.
     conn = db.get_connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT DISTINCT JSON_UNQUOTE(JSON_EXTRACT(e.extra,'$.base_zone')) AS zone "
-                "FROM events e JOIN games g ON e.game_id=g.id "
-                "WHERE e.event_type='zone_change' AND g.code=%s",
+                "SELECT ev.character_id, ev.ts, "
+                "JSON_UNQUOTE(JSON_EXTRACT(ev.extra,'$.base_zone')) AS zone "
+                "FROM events ev JOIN games g ON ev.game_id=g.id "
+                "WHERE ev.event_type='zone_change' AND g.code=%s ORDER BY ev.character_id, ev.ts",
                 (game,),
             )
-            zones = sorted(r["zone"] for r in cur.fetchall() if r["zone"])
+            zone_changes = cur.fetchall()
 
             cur.execute(
-                "SELECT ev.source_name AS npc, ev.amount AS level, "
-                "  JSON_EXTRACT(ev.extra,'$.rare')=true AS rare, "
-                f"  {_base_zone_expr()} AS zone "
+                "SELECT ev.character_id, ev.ts, ev.source_name AS npc, ev.amount AS level, "
+                "  JSON_EXTRACT(ev.extra,'$.rare')=true AS rare "
                 "FROM events ev JOIN games g ON ev.game_id=g.id "
                 "WHERE ev.event_type='con' AND g.code=%s",
                 (game,),
             )
-            con_rows = [r for r in cur.fetchall() if r["zone"]]
+            con_rows_raw = cur.fetchall()
 
             # Level range is restricted to NPCs actually fought (not just
             # /con'd) -- a zone's quest-giver/vendor/lore NPCs are often
@@ -1178,29 +1180,55 @@ def _compute_zone_list(game):
             # rare_count by counting as two.
             fought_names = {r["name"].lower() for r in cur.fetchall() if r["name"]}
 
-            con_by_zone = {}
-            for r in con_rows:
-                entry = con_by_zone.setdefault(r["zone"], {"levels": [], "rare_names": set()})
-                if r["rare"]:
-                    entry["rare_names"].add(r["npc"].lower())
-                if r["npc"].lower() in fought_names:
-                    entry["levels"].append(r["level"])
-
             cur.execute(
-                "SELECT zone, COUNT(DISTINCT source_name) AS npc_count FROM ("
-                "  SELECT ev.source_name, "
-                f"    {_base_zone_expr()} AS zone "
-                "  FROM events ev JOIN games g ON ev.game_id=g.id "
-                "  WHERE ev.event_type IN ('con','npc_dialogue') AND g.code=%s"
-                ") t WHERE zone IS NOT NULL GROUP BY zone",
+                "SELECT ev.character_id, ev.ts, ev.source_name "
+                "FROM events ev JOIN games g ON ev.game_id=g.id "
+                "WHERE ev.event_type IN ('con','npc_dialogue') AND g.code=%s",
                 (game,),
             )
-            npc_by_zone = {r["zone"]: r["npc_count"] for r in cur.fetchall()}
+            npc_rows_raw = cur.fetchall()
 
             cur.execute("SELECT zone, level_min_override, level_max_override, note FROM zone_info")
             overrides = {r["zone"]: r for r in cur.fetchall()}
     finally:
         conn.close()
+
+    # Same "most recent zone_change at or before ts, per character" lookup
+    # as _base_zone_expr, done once here instead of as a correlated SQL
+    # subquery -- see this function's comment above for why.
+    zc_by_char: dict = {}
+    for r in zone_changes:
+        zc = zc_by_char.setdefault(r["character_id"], {"ts": [], "zone": []})
+        zc["ts"].append(r["ts"])
+        zc["zone"].append(r["zone"])
+
+    def zone_at(character_id, ts):
+        zc = zc_by_char.get(character_id)
+        if not zc:
+            return None
+        i = bisect.bisect_right(zc["ts"], ts) - 1
+        return zc["zone"][i] if i >= 0 else None
+
+    zones = sorted({z for z in (r["zone"] for r in zone_changes) if z})
+
+    con_by_zone = {}
+    for r in con_rows_raw:
+        zone = zone_at(r["character_id"], r["ts"])
+        if not zone:
+            continue
+        entry = con_by_zone.setdefault(zone, {"levels": [], "rare_names": set()})
+        if r["rare"]:
+            entry["rare_names"].add(r["npc"].lower())
+        if r["npc"].lower() in fought_names:
+            entry["levels"].append(r["level"])
+
+    zone_npc_sets: dict = {}
+    for r in npc_rows_raw:
+        zone = zone_at(r["character_id"], r["ts"])
+        if not zone:
+            continue
+        zone_npc_sets.setdefault(zone, set()).add(r["source_name"])
+    npc_by_zone = {zone: len(names) for zone, names in zone_npc_sets.items()}
 
     rows = []
     for zone in zones:
