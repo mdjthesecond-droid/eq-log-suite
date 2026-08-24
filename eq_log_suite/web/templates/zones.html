@@ -15,8 +15,9 @@ Info</a> instead.</p>
 <form method="get" action="/zones/{{ game }}">
   <input name="character" placeholder="character" value="{{ filters.character }}">
   <input name="zone" placeholder="zone contains" value="{{ filters.zone }}">
-  <input name="start_ts" type="datetime-local" title="entered after" value="{{ filters.start_ts }}">
-  <input name="end_ts" type="datetime-local" title="entered before" value="{{ filters.end_ts }}">
+  <input id="start-ts-input" name="start_ts" type="datetime-local" title="entered after" value="{{ filters.start_ts }}">
+  <input id="end-ts-input" name="end_ts" type="datetime-local" title="entered before" value="{{ filters.end_ts }}">
+  <button type="button" id="today-btn" title="fill start/end with today, 00:00 to now">Today</button>
   <button type="submit">Search</button>
 </form>
 
@@ -64,4 +65,19 @@ Info</a> instead.</p>
   </tbody>
 </table>
 </div>
+
+<script>
+  // Fills the date range with today, 00:00 through right now -- so a same-day
+  // lookup doesn't require typing both timestamps by hand every time.
+  function pad(n) { return String(n).padStart(2, "0"); }
+  function localDatetimeValue(d) {
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+  document.getElementById("today-btn").addEventListener("click", () => {
+    const now = new Date();
+    const midnight = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    document.getElementById("start-ts-input").value = localDatetimeValue(midnight);
+    document.getElementById("end-ts-input").value = localDatetimeValue(now);
+  });
+</script>
 {% endblock %}
