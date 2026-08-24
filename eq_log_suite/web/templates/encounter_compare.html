@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block title %}Compare Encounters{% endblock %}
+{% block content %}
+<h1>Compare Encounters</h1>
+<p style="opacity:0.8;">Each side is its own full breakdown -- scrolling a table left/right on one side scrolls
+the matching table on the other side too, so the same column (e.g. hit%) lines up across both.</p>
+
+<div style="display:flex; gap:0.8rem; align-items:flex-start;">
+  {% for s in sides %}
+  <div style="flex:1 1 0; min-width:0; border:1px solid var(--border); border-radius:6px; overflow:hidden;">
+    <iframe class="compare-frame" style="width:100%; height:80vh; border:none; display:block;"
+      src="/encounters/breakdown?{{ {'character': s.character, 'start_ts': s.start_ts, 'stop_ts': s.stop_ts, 'npc': s.npc}|urlencode }}"></iframe>
+  </div>
+  {% endfor %}
+</div>
+
+<script>
+  // Pairs up each side's .scroll-frame elements by position (Nth on the
+  // left <-> Nth on the right) once both iframes finish loading, and
+  // mirrors horizontal scroll between each pair. Positional, not matched
+  // by NPC name, since the two sides can have different mobs/combatants --
+  // good enough for the common case (comparing gear against the same
+  // dummy/mob, where both sides render the same block order).
+  const frames = document.querySelectorAll(".compare-frame");
+  let loadedCount = 0;
+  frames.forEach((f) => {
+    f.addEventListener("load", () => {
+      loadedCount += 1;
+      if (loadedCount === frames.length) wireScrollSync();
+    });
+  });
+
+  function wireScrollSync() {
+    const [left, right] = frames;
+    if (!left.contentDocument || !right.contentDocument) return;  // cross-origin guard, shouldn't happen (same-origin app)
+    const leftFrames = left.contentDocument.querySelectorAll(".scroll-frame");
+    const rightFrames = right.contentDocument.querySelectorAll(".scroll-frame");
+    const n = Math.min(leftFrames.length, rightFrames.length);
+    for (let i = 0; i < n; i++) {
+      let syncing = false;
+      const a = leftFrames[i], b = rightFrames[i];
+      a.addEventListener("scroll", () => {
+        if (syncing) return;
+        syncing = true;
+        b.scrollLeft = a.scrollLeft;
+        syncing = false;
+      });
+      b.addEventListener("scroll", () => {
+        if (syncing) return;
+        syncing = true;
+        a.scrollLeft = b.scrollLeft;
+        syncing = false;
+      });
+    }
+  }
+</script>
+{% endblock %}

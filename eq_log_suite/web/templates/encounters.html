@@ -79,6 +79,7 @@ a few weeks of history.</p>
   border:1px solid var(--border); border-radius:6px; margin-bottom:0.6rem; background:var(--bg, #12141c);">
   <span id="merge-count"></span>
   <button type="button" id="merge-btn" style="margin-left:0.8rem;">Merge selected -&gt; breakdown</button>
+  <button type="button" id="compare-btn" style="margin-left:0.4rem;" title="pick exactly 2 to compare">Compare selected</button>
   <button type="button" id="merge-clear" style="margin-left:0.4rem;">Clear selection</button>
 </div>
 
@@ -275,6 +276,7 @@ a few weeks of history.</p>
     const n = selectedItems.size;
     document.getElementById("merge-bar").style.display = n >= 2 ? "" : "none";
     document.getElementById("merge-count").textContent = `${n} item(s) selected`;
+    document.getElementById("compare-btn").disabled = n !== 2;
   }
   document.querySelectorAll(".enc-select").forEach((cb) => {
     cb.addEventListener("change", () => {
@@ -325,6 +327,17 @@ a few weeks of history.</p>
       params.append("npc", w.npc || "");
     }
     window.open(`/encounters/breakdown/merged?${params}`, "_blank");
+  });
+  document.getElementById("compare-btn").addEventListener("click", () => {
+    if (selectedItems.size !== 2) return;
+    const params = new URLSearchParams();
+    for (const w of selectedItems.values()) {
+      params.append("character", w.character);
+      params.append("start_ts", w.start_ts);
+      params.append("stop_ts", w.stop_ts);
+      params.append("npc", w.npc || "");
+    }
+    window.open(`/encounters/compare?${params}`, "_blank");
   });
   document.getElementById("merge-clear").addEventListener("click", () => {
     selectedItems.clear();

@@ -2955,12 +2955,12 @@ def _build_encounter_damage_totals(totals_rows, duration_s):
 
 
 @app.get("/encounters/breakdown", response_class=HTMLResponse)
-def encounter_breakdown(request: Request, character: str, start_ts: str, stop_ts: str = ""):
+def encounter_breakdown(request: Request, character: str, start_ts: str, stop_ts: str = "", npc: str = ""):
     start_dt = datetime.fromisoformat(start_ts)
     end_dt = datetime.fromisoformat(stop_ts) if stop_ts else datetime.now()
     duration_s = max(round((end_dt - start_dt).total_seconds()), 1)
 
-    windows = [{"character": character, "start_ts": start_ts, "stop_ts": stop_ts}]
+    windows = [{"character": character, "start_ts": start_ts, "stop_ts": stop_ts, "npc": npc or None}]
     npcs = _build_encounter_breakdown_npcs(windows, label_self_as_you=True, split_you=True, duration_s=duration_s)
     healers = _build_encounter_healing(windows, label_self_as_you=True, duration_s=duration_s)
     procs = _compute_encounter_procs(windows)
@@ -2976,7 +2976,7 @@ def encounter_breakdown(request: Request, character: str, start_ts: str, stop_ts
         "start_ts": start_ts,
         "stop_ts": stop_ts or end_dt.isoformat(timespec="seconds"),
         "duration_s": duration_s,
-        "filters": {"character": character, "start_ts": start_ts, "stop_ts": stop_ts},
+        "filters": {"character": character, "start_ts": start_ts, "stop_ts": stop_ts, "npc": npc},
     })
 
 
@@ -3046,6 +3046,33 @@ def encounter_breakdown_merged(
         "duration_s": duration_s,
         "filters": {"character": "", "start_ts": "", "stop_ts": ""},
     })
+
+
+@app.get("/encounters/compare", response_class=HTMLResponse)
+def encounters_compare(
+    request: Request,
+    character: list[str] = Query(...),
+    start_ts: list[str] = Query(...),
+    stop_ts: list[str] = Query(default=[]),
+    npc: list[str] = Query(default=[]),
+):
+    # Exactly 2 -- unlike /encounters/breakdown/merged (which sums an
+    # arbitrary number of picks into one combined view), this shows each
+    # side's own full breakdown independently (embedded via iframe, so
+    # zero duplication of the single-encounter rendering/computation) with
+    # their .scroll-frame tables scroll-synced left/right -- for lining up
+    # the same column (e.g. hit%) across two gear-loadout runs, most useful
+    # paired with a named Encounter Start marker (see
+    # [[project_encounter_markers]]).
+    if len(character) != 2 or len(start_ts) != 2:
+        raise HTTPException(400, "compare requires exactly 2 encounters")
+    stop_ts = stop_ts + [""] * (2 - len(stop_ts))
+    npc = npc + [""] * (2 - len(npc))
+    sides = [
+        {"character": c, "start_ts": s, "stop_ts": e, "npc": n}
+        for c, s, e, n in zip(character, start_ts, stop_ts, npc)
+    ]
+    return templates.TemplateResponse(request, "encounter_compare.html", {"sides": sides})
 
 
 @app.get("/api/encounters/detail")
