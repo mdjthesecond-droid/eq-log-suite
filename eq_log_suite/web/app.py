@@ -2500,7 +2500,7 @@ def _compute_encounter_combat_breakdown(windows, label_self_as_you=True):
         return {
             **identity,
             "attempts": 0, "landed": 0, "crits": 0, "misses": 0,
-            "dodged": 0, "parried": 0, "blocked": 0, "riposted": 0, "resisted": 0,
+            "dodged": 0, "parried": 0, "blocked": 0, "riposted": 0, "resisted": 0, "absorbed": 0,
             "hit_amounts": [], "crit_amounts": [],
         }
 
@@ -2572,6 +2572,8 @@ def _compute_encounter_combat_breakdown(windows, label_self_as_you=True):
                 b["riposted"] += 1
             elif outcome == "resist":
                 b["resisted"] += 1
+            elif outcome == "absorb":
+                b["absorbed"] += 1
 
     def pct(n, den):
         return round(n / den * 100, 1) if den else None
@@ -2581,7 +2583,7 @@ def _compute_encounter_combat_breakdown(windows, label_self_as_you=True):
         hit_amts, crit_amts = b["hit_amounts"], b["crit_amounts"]
         row = {k: v for k, v in b.items() if k not in (
             "attempts", "landed", "crits", "misses", "dodged", "parried",
-            "blocked", "riposted", "resisted", "hit_amounts", "crit_amounts",
+            "blocked", "riposted", "resisted", "absorbed", "hit_amounts", "crit_amounts",
         )}
         row.update({
             "total_damage": sum(hit_amts) + sum(crit_amts),
@@ -2594,6 +2596,7 @@ def _compute_encounter_combat_breakdown(windows, label_self_as_you=True):
             "block_pct": pct(b["blocked"], attempts),
             "riposte_pct": pct(b["riposted"], attempts),
             "resist_pct": pct(b["resisted"], attempts),
+            "absorb_pct": pct(b["absorbed"], attempts),
             "min_hit": min(hit_amts) if hit_amts else None,
             "avg_hit": round(sum(hit_amts) / len(hit_amts), 1) if hit_amts else None,
             "max_hit": max(hit_amts) if hit_amts else None,
@@ -2675,6 +2678,62 @@ def _compute_encounter_healing_breakdown(windows, label_self_as_you=True):
         b["overheal"] += extra.get("overheal", 0)
 
     return list(buckets.values())
+
+
+def _compute_encounter_procs(windows):
+    """Proc-trigger counts (event_type='proc_trigger', see h_proc_trigger in
+    eq_legends.py) and rune_gain totals (event_type='rune_gain', see
+    h_rune_gain), across one or more windows -- same window-OR'ing
+    convention as _compute_encounter_combat_breakdown. Self-only events (no
+    target/npc), so no per-mob split -- just a flat count per proc name and
+    a rune_gain summary. Lets a named "Encounter Start daggers"-style run
+    (see [[project_encounter_markers]]) be compared against another gear
+    loadout for proc rate and rune size, not just damage."""
+    if not windows:
+        return {"procs": [], "rune_gains": None}
+
+    clauses, params = [], []
+    for w in windows:
+        clause = "(c.name = %s AND ev.ts >= %s"
+        wparams = [w["character"], w["start_ts"]]
+        if w.get("stop_ts"):
+            clause += " AND ev.ts <= %s"
+            wparams.append(w["stop_ts"])
+        clause += ")"
+        clauses.append(clause)
+        params.extend(wparams)
+    where = " OR ".join(clauses)
+
+    conn = db.get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT ev.target_name AS proc, COUNT(*) AS triggers "
+                "FROM events ev JOIN characters c ON ev.character_id=c.id "
+                f"WHERE ({where}) AND ev.event_type='proc_trigger' "
+                "GROUP BY ev.target_name ORDER BY triggers DESC",
+                params,
+            )
+            procs = cur.fetchall()
+
+            cur.execute(
+                "SELECT COUNT(*) AS gains, SUM(ev.amount) AS total, "
+                "MIN(ev.amount) AS min_amt, MAX(ev.amount) AS max_amt "
+                "FROM events ev JOIN characters c ON ev.character_id=c.id "
+                f"WHERE ({where}) AND ev.event_type='rune_gain'",
+                params,
+            )
+            rune_row = cur.fetchone()
+    finally:
+        conn.close()
+
+    rune_gains = None
+    if rune_row and rune_row["gains"]:
+        rune_gains = {
+            "count": rune_row["gains"], "total": rune_row["total"],
+            "min": rune_row["min_amt"], "max": rune_row["max_amt"],
+        }
+    return {"procs": procs, "rune_gains": rune_gains}
 
 
 def _build_encounter_healing(windows, label_self_as_you, duration_s):
@@ -2794,11 +2853,14 @@ def encounter_breakdown(request: Request, character: str, start_ts: str, stop_ts
     windows = [{"character": character, "start_ts": start_ts, "stop_ts": stop_ts}]
     npcs = _build_encounter_breakdown_npcs(windows, label_self_as_you=True, split_you=True, duration_s=duration_s)
     healers = _build_encounter_healing(windows, label_self_as_you=True, duration_s=duration_s)
+    procs = _compute_encounter_procs(windows)
 
     return templates.TemplateResponse(request, "encounter_breakdown.html", {
         "npcs": npcs,
         "damage_totals": None,
         "healers": healers,
+        "procs": procs["procs"],
+        "rune_gains": procs["rune_gains"],
         "merged": False,
         "windows": None,
         "start_ts": start_ts,
@@ -2859,11 +2921,14 @@ def encounter_breakdown_merged(
     _, _, totals_rows = _compute_encounter_combat_breakdown(windows, label_self_as_you=False)
     damage_totals = _build_encounter_damage_totals(totals_rows, duration_s)
     healers = _build_encounter_healing(unique_time_windows, label_self_as_you=False, duration_s=duration_s)
+    procs = _compute_encounter_procs(unique_time_windows)
 
     return templates.TemplateResponse(request, "encounter_breakdown.html", {
         "npcs": [],
         "damage_totals": damage_totals,
         "healers": healers,
+        "procs": procs["procs"],
+        "rune_gains": procs["rune_gains"],
         "merged": True,
         "windows": windows,
         "start_ts": windows[0]["start_ts"],

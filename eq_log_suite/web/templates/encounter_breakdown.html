@@ -56,7 +56,7 @@
   <thead>
     <tr>
       <th>attack</th><th>total dmg</th><th>attempts</th><th>hit %</th><th>crit %</th><th>miss %</th>
-      <th>dodged %</th><th>parried %</th><th>blocked %</th><th>riposted %</th><th>resisted %</th>
+      <th>dodged %</th><th>parried %</th><th>blocked %</th><th>riposted %</th><th>resisted %</th><th>absorbed %</th>
       <th>min dmg (hit)</th><th>avg dmg (hit)</th><th>max dmg (hit)</th>
       <th>min dmg (crit)</th><th>avg dmg (crit)</th><th>max dmg (crit)</th>
     </tr>
@@ -75,6 +75,7 @@
       <td>{{ r.block_pct if r.block_pct is not none else '' }}</td>
       <td>{{ r.riposte_pct if r.riposte_pct is not none else '' }}</td>
       <td>{{ r.resist_pct if r.resist_pct is not none else '' }}</td>
+      <td>{{ r.absorb_pct if r.absorb_pct is not none else '' }}</td>
       <td>{{ r.min_hit if r.min_hit is not none else '' }}</td>
       <td>{{ r.avg_hit if r.avg_hit is not none else '' }}</td>
       <td>{{ r.max_hit if r.max_hit is not none else '' }}</td>
@@ -202,6 +203,24 @@
 
 </div>
 {% endfor %}
+{% endif %}
+
+<h2>Procs</h2>
+{% if not procs and not rune_gains %}
+<p style="opacity:0.8;">No proc triggers in this window.</p>
+{% else %}
+<table style="margin-bottom:1rem;">
+  {% for p in procs %}
+  <tr><td style="opacity:0.7; padding-right:1rem;">{{ p.proc }}</td>
+      <td>{{ p.triggers }} trigger(s)</td>
+      <td style="opacity:0.7;">-- {{ (p.triggers / (duration_s / 60))|round(2) if duration_s else 0 }}/min</td></tr>
+  {% endfor %}
+  {% if rune_gains %}
+  <tr><td style="opacity:0.7; padding-right:1rem;">Rune (absorption)</td>
+      <td>{{ rune_gains.count }} gained, {{ rune_gains.total }} total points</td>
+      <td style="opacity:0.7;">-- {{ rune_gains.min }}{% if rune_gains.min != rune_gains.max %}-{{ rune_gains.max }}{% endif %} each</td></tr>
+  {% endif %}
+</table>
 {% endif %}
 
 <h2>Healing</h2>

@@ -147,6 +147,81 @@ def h_evade_incoming(m):
     )
 
 
+def h_absorb_incoming_self(m):
+    # "A hill giant tries to bash YOU, but YOUR magical skin absorbs the
+    # blow!" -- a rune (see h_rune_gain) fully absorbing an incoming attack,
+    # confirmed real 2026-08-24. Unlike dodge/parry/riposte/block (only ever
+    # reported for the log owner), this is also reported for other players
+    # in the group/raid -- see h_absorb_incoming_other. Folded into the
+    # existing 'melee' outcome vocabulary (outcome='absorb') rather than a
+    # new event_type, so it flows through the same hit/evasion %% breakdown
+    # (_compute_encounter_combat_breakdown) other outcomes already use.
+    source = m.group("source")
+    return ParsedEvent(
+        ts=None, raw_line=None, event_type="melee",
+        source_name=source, source_type=GameParser.classify_actor(source),
+        target_name="You", target_type="you",
+        verb=m.group("verb"), amount=None, outcome="absorb",
+    )
+
+
+def h_absorb_incoming_other(m):
+    # "Orc centurion tries to hit Deepdruid, but Deepdruid's magical skin
+    # absorbs the blow!" -- same as h_absorb_incoming_self but for another
+    # named player (confirmed real 2026-08-24, "Deepdruid"/"Pojj" both
+    # seen). The backreference in the pattern requires the possessive name
+    # to match the target name exactly, so this can't misfire on some
+    # unrelated "X's ... Y's ..." sentence shape.
+    source = m.group("source")
+    target = m.group("target")
+    return ParsedEvent(
+        ts=None, raw_line=None, event_type="melee",
+        source_name=source, source_type=GameParser.classify_actor(source),
+        target_name=target, target_type=GameParser.classify_actor(target),
+        verb=m.group("verb"), amount=None, outcome="absorb",
+    )
+
+
+def h_rune_gain(m):
+    # "You gain a rune for 90 points of absorption." -- confirmed real
+    # 2026-08-24, amounts seen ranging 34-90 across different sessions
+    # (gear/level dependent). No proc name is stated in this line itself --
+    # confirmed real that it lands at the same timestamp as "You feel the
+    # urge to rampage." (see _PROC_TRIGGER_PHRASES) but nothing in the text
+    # itself ties the two together, so this is recorded as its own
+    # independent event rather than asserting a causal link only inferred
+    # from adjacency. Encounter Breakdown correlates them by simply being
+    # in the same window.
+    return ParsedEvent(
+        ts=None, raw_line=None, event_type="rune_gain",
+        source_name="You", source_type="you",
+        target_name=None, target_type=None,
+        verb=None, amount=_amount(m), outcome=None,
+    )
+
+
+# Self-triggered "proc" messages -- effects that fire probabilistically
+# (gear/skill dependent) rather than a direct player action, distinct from
+# casting a spell. Only phrases confirmed real against an actual log belong
+# here (see feedback_verify_parser_patterns_against_real_logs.md) -- add
+# more entries here as they're confirmed, rather than guessing at other EQ
+# procs by name. Keying by exact phrase and looking it up in the handler
+# (rather than one dedicated regex per proc) keeps adding a new one a
+# one-line change.
+_PROC_TRIGGER_PHRASES = {
+    "You feel the urge to rampage.": "Rampage",
+}
+
+
+def h_proc_trigger(m):
+    return ParsedEvent(
+        ts=None, raw_line=None, event_type="proc_trigger",
+        source_name="You", source_type="you",
+        target_name=_PROC_TRIGGER_PHRASES[m.group(0)], target_type=None,
+        verb=None, amount=None, outcome=None,
+    )
+
+
 def _heal_extra(m):
     # "You healed X for 5 (10) hit points by Spell." -- 5 is what the target
     # actually gained (capped by their missing HP), 10 is what the spell
@@ -713,6 +788,25 @@ class EQLegendsParser(GameParser):
             r"^(?P<source>.+?) tries to (?P<verb>" + INCOMING_ATTACK_VERB_ALT + r") YOU, but YOU "
             r"(?P<outcome>dodge|parry|riposte|block)!$"
         ), h_evade_incoming),
+
+        # "A hill giant tries to bash YOU, but YOUR magical skin absorbs the blow!"
+        (re.compile(
+            r"^(?P<source>.+?) tries to (?P<verb>" + INCOMING_ATTACK_VERB_ALT + r") YOU, but YOUR "
+            r"magical skin absorbs the blow!$"
+        ), h_absorb_incoming_self),
+
+        # "Orc centurion tries to hit Deepdruid, but Deepdruid's magical skin absorbs the blow!"
+        # Must come after the YOU-target pattern above (that one's more specific).
+        (re.compile(
+            r"^(?P<source>.+?) tries to (?P<verb>" + INCOMING_ATTACK_VERB_ALT + r") "
+            r"(?P<target>.+?), but (?P=target)'s magical skin absorbs the blow!$"
+        ), h_absorb_incoming_other),
+
+        # "You gain a rune for 90 points of absorption."
+        (re.compile(r"^You gain a rune for (?P<amount>\d+) points? of absorption\.$"), h_rune_gain),
+
+        # Self-triggered proc messages -- see _PROC_TRIGGER_PHRASES above.
+        (re.compile("^(?:" + "|".join(re.escape(p) for p in _PROC_TRIGGER_PHRASES) + ")$"), h_proc_trigger),
 
         # "You healed Cheerful for 349 hit points by Greater Healing."
         # "You healed Cheerful for 5 (10) hit points by Blood Siphon Strike."
