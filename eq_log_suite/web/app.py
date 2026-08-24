@@ -801,110 +801,6 @@ def tasks_report_eq(request: Request, character: str = "", task: str = "", npc: 
     })
 
 
-def _compute_attack_breakdown(conn, direction, character="", game="", start_ts="", end_ts=""):
-    """Per-verb (melee attack type or spell name) combat breakdown: hit/crit
-    rate, evasion (dodge/parry/block/riposte) rate, resist rate (outgoing
-    only -- no sample of an incoming "you resisted X's spell" line exists
-    yet to build that pattern from), and min/avg/max damage split by hit vs
-    crit. direction='out' is your own attacks (source_type='you'), 'in' is
-    attacks against you (target_type='you')."""
-    clauses, params = [], []
-    if direction == "out":
-        clauses.append("e.source_type='you'")
-        clauses.append("e.event_type IN ('melee','spell_damage','spell_resist')")
-    else:
-        clauses.append("e.target_type='you'")
-        clauses.append("e.event_type IN ('melee','spell_damage')")
-    clauses.append("e.verb IS NOT NULL")
-    if character:
-        clauses.append("c.name = %s"); params.append(character)
-    if game:
-        clauses.append("g.code = %s"); params.append(game)
-    if start_ts:
-        clauses.append("e.ts >= %s"); params.append(start_ts)
-    if end_ts:
-        clauses.append("e.ts <= %s"); params.append(end_ts)
-    where = " AND ".join(clauses)
-
-    sql = (
-        "SELECT e.verb, "
-        "  COUNT(*) AS attempts, "
-        "  SUM(e.outcome IN ('hit','crit')) AS landed, "
-        "  SUM(e.outcome='crit') AS crits, "
-        "  SUM(e.outcome='miss') AS misses, "
-        "  SUM(e.outcome='dodge') AS dodged, "
-        "  SUM(e.outcome='parry') AS parried, "
-        "  SUM(e.outcome='block') AS blocked, "
-        "  SUM(e.outcome='riposte') AS riposted, "
-        "  SUM(e.outcome='resist') AS resisted, "
-        "  MIN(CASE WHEN e.outcome='hit' THEN e.amount END) AS min_hit, "
-        "  AVG(CASE WHEN e.outcome='hit' THEN e.amount END) AS avg_hit, "
-        "  MAX(CASE WHEN e.outcome='hit' THEN e.amount END) AS max_hit, "
-        "  MIN(CASE WHEN e.outcome='crit' THEN e.amount END) AS min_crit, "
-        "  AVG(CASE WHEN e.outcome='crit' THEN e.amount END) AS avg_crit, "
-        "  MAX(CASE WHEN e.outcome='crit' THEN e.amount END) AS max_crit "
-        "FROM events e JOIN characters c ON e.character_id=c.id JOIN games g ON g.id=c.game_id "
-        f"WHERE {where} "
-        "GROUP BY e.verb ORDER BY attempts DESC"
-    )
-    with conn.cursor() as cur:
-        cur.execute(sql, params)
-        rows = cur.fetchall()
-
-    def pct(num, den):
-        return round(num / den * 100, 1) if den else None
-
-    result = []
-    for r in rows:
-        attempts = int(r["attempts"])
-        landed = int(r["landed"])
-        result.append({
-            "verb": r["verb"],
-            "attempts": attempts,
-            "hit_pct": pct(landed, attempts),
-            "crit_pct": pct(int(r["crits"]), landed),
-            "miss_pct": pct(int(r["misses"]), attempts),
-            "dodge_pct": pct(int(r["dodged"]), attempts),
-            "parry_pct": pct(int(r["parried"]), attempts),
-            "block_pct": pct(int(r["blocked"]), attempts),
-            "riposte_pct": pct(int(r["riposted"]), attempts),
-            "resist_pct": pct(int(r["resisted"]), attempts),
-            "min_hit": r["min_hit"],
-            "avg_hit": round(float(r["avg_hit"]), 1) if r["avg_hit"] is not None else None,
-            "max_hit": r["max_hit"],
-            "min_crit": r["min_crit"],
-            "avg_crit": round(float(r["avg_crit"]), 1) if r["avg_crit"] is not None else None,
-            "max_crit": r["max_crit"],
-        })
-    return result
-
-
-def _render_attacks(request, game, game_label, character, start_ts, end_ts):
-    conn = db.get_connection()
-    try:
-        outgoing = _compute_attack_breakdown(conn, "out", character, game, start_ts, end_ts)
-        incoming = _compute_attack_breakdown(conn, "in", character, game, start_ts, end_ts)
-    finally:
-        conn.close()
-    return templates.TemplateResponse(request, "attacks.html", {
-        "outgoing": outgoing,
-        "incoming": incoming,
-        "game": game,
-        "game_label": game_label,
-        "filters": {"character": character, "start_ts": start_ts, "end_ts": end_ts},
-    })
-
-
-@app.get("/attacks/eql", response_class=HTMLResponse)
-def attacks_breakdown_eql(request: Request, character: str = "", start_ts: str = "", end_ts: str = ""):
-    return _render_attacks(request, "eql", "EQ Legends", character, start_ts, end_ts)
-
-
-@app.get("/attacks/eq", response_class=HTMLResponse)
-def attacks_breakdown_eq(request: Request, character: str = "", start_ts: str = "", end_ts: str = ""):
-    return _render_attacks(request, "eq", "EverQuest", character, start_ts, end_ts)
-
-
 def _compute_zones(game, character="", zone="", start_ts="", end_ts=""):
     # This is the expensive one: the LEFT JOIN below re-scans events across
     # every zone-visit session's full time window to compute combat stats --
@@ -2427,9 +2323,12 @@ def _compute_encounter_combat_breakdown(windows, label_self_as_you=True):
     """Full breakdown across one or more (character, start_ts, stop_ts[, npc])
     windows: every attack type (melee verb or spell name), split by
     combatant vs NPC and by direction (combatant attacking the NPC, or the
-    NPC attacking the combatant) -- the /attacks page's per-verb
-    granularity, scoped to the given window(s) and not just to 'you'. Each
-    window is OR'd into a single query, so rows from several (possibly
+    NPC attacking the combatant) -- hit/crit rate, evasion, resist rate,
+    min/avg/max damage per verb (the standalone /attacks page used to show
+    this unscoped to any encounter; removed 2026-08-24 since the numbers
+    meant nothing without knowing which fight they came from -- this is
+    the same data, scoped to the given window(s) instead of just to 'you').
+    Each window is OR'd into a single query, so rows from several (possibly
     disjoint, possibly different-character) windows land in the same
     verb/npc buckets and merge for free -- this is what powers both a
     single encounter's breakdown (one window) and a merged multi-encounter
