@@ -70,7 +70,10 @@ def _format_dps(snap: dict) -> str:
     hit_txt = f"{hit_pct:.0f}%" if hit_pct is not None else "--"
     crit_txt = f"{crit_pct:.0f}%" if crit_pct is not None else "--"
     status = "" if snap.get("state") == "active" else " (paused)"
-    return f"DPS {snap.get('dps', 0):,.0f}  Hit {hit_txt}  Crit {crit_txt}{status}"
+    return (
+        f"Dmg {snap.get('damage', 0):,.0f}  {snap.get('elapsed', 0):.1f}s  "
+        f"DPS {snap.get('dps', 0):,.0f}  Hit {hit_txt}  Crit {crit_txt}{status}"
+    )
 
 
 def _write_if_changed(path: Path, text: str, last_written: str | None) -> str:

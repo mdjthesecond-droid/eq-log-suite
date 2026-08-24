@@ -103,6 +103,31 @@ class DPSTracker:
             return True
         return False
 
+    def force_start(self, now: float):
+        """Forces a fresh window to begin exactly at `now`, discarding
+        whatever was previously tracked -- unlike _ensure_active (which only
+        resets if not already active), this always resets. Driven by an
+        explicit "Encounter Start" /say marker (see h_encounter_marker) so a
+        dummy/gear-testing pull gets its own clean window regardless of
+        whatever combat state preceded it."""
+        self.active = True
+        self.start_time = now
+        self.total_damage = 0
+        self.swings = 0
+        self.landed = 0
+        self.crits = 0
+        self.last_activity_time = now
+
+    def force_stop(self, now: float) -> dict | None:
+        """Freezes the window exactly at `now`, rather than waiting for the
+        natural COMBAT_TIMEOUT_SECONDS gap, and returns its final snapshot.
+        Driven by an explicit "Encounter Stop" /say marker."""
+        if self.start_time is None:
+            return None
+        self.active = False
+        self.last_activity_time = now
+        return self.snapshot(now)
+
     def snapshot(self, now: float) -> dict | None:
         if self.start_time is None:
             return None
@@ -250,6 +275,23 @@ async def tail_log_source(conn, log_source, broadcaster: OverlayBroadcaster):
                         "label": f"{character_name} ({game_code})",
                         "zone": event.target_name,
                     })
+
+                if event.event_type == "encounter_marker" and event.source_type == "you":
+                    # "Encounter Start"/"Encounter Stop" /say markers -- same
+                    # concept as the server-side hard-start/hard-stop rows
+                    # (see _derive_gap_based_encounters), applied to the live
+                    # DPS meter too: freezes duration/damage exactly at the
+                    # marker's own timestamp instead of the usual
+                    # COMBAT_TIMEOUT_SECONDS gap, for dummy/gear-testing.
+                    if event.verb == "start":
+                        dps.force_start(now)
+                        broadcaster.send(dps.snapshot(now))
+                        dps.last_broadcast = now
+                    elif event.verb == "stop":
+                        snap = dps.force_stop(now)
+                        if snap:
+                            broadcaster.send(snap)
+                            dps.last_broadcast = now
 
                 if event.source_type == "you":
                     activity = False
