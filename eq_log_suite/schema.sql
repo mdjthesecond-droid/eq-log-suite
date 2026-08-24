@@ -3,7 +3,7 @@
 
 CREATE TABLE IF NOT EXISTS games (
     id INT AUTO_INCREMENT PRIMARY KEY,
-    code VARCHAR(16) NOT NULL UNIQUE,   -- 'eql', 'eq2', ...
+    code VARCHAR(16) NOT NULL UNIQUE,   -- 'eql', 'eq', ...
     name VARCHAR(64) NOT NULL
 ) ENGINE=InnoDB;
 
@@ -93,25 +93,11 @@ CREATE TABLE IF NOT EXISTS alert_log (
     INDEX idx_rule_ts (rule_id, ts)
 ) ENGINE=InnoDB;
 
--- User-curated node -> tradeskill tier mapping (tier isn't stated anywhere
--- in the log text itself). Assigning a node's tier here is a one-time
--- interaction -- every future pull from that node, and every past one
--- already in `events`, picks it up automatically via a join on node name.
--- /gathering flags any node missing from this table so nothing goes
--- unnoticed. Also incidentally answers "which tier(s) show up in which
--- zone" by joining this against the zone inferred per gather event.
-CREATE TABLE IF NOT EXISTS node_tiers (
-    node VARCHAR(255) NOT NULL PRIMARY KEY,
-    tier VARCHAR(32) NOT NULL,
-    note VARCHAR(255) NULL,
-    identified_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-) ENGINE=InnoDB;
-
 -- User-curated NPC type (log text can strongly suggest "vendor" via
 -- vendor_buy/vendor_sell events, or "mob" via classify_actor's
 -- article-prefix heuristic, but can't say "class trainer" or otherwise
 -- distinguish a unique-named NPC from a unique-named mob) -- /npcs shows
--- an auto-suggested type alongside this override, same UX as node_tiers.
+-- an auto-suggested type alongside this override.
 CREATE TABLE IF NOT EXISTS npc_info (
     npc VARCHAR(255) NOT NULL PRIMARY KEY,
     npc_type VARCHAR(32) NULL,
@@ -131,38 +117,21 @@ CREATE TABLE IF NOT EXISTS zone_info (
     confirmed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB;
 
--- Zone correlation (used by /loot, /gathering, /quests) works by finding the
+-- Zone correlation (used by /loot, /quests) works by finding the
 -- most recent zone_change logged before an event's own ts -- but a
 -- character's very first bit of activity, before their first zone_change
 -- was ever logged (log file started mid-session, or /log was toggled on
 -- after already zoning in), has no such row to find, and shows up as
 -- "(unknown zone)". The log itself has no way to recover that -- this is a
 -- one-time, per-character, user-confirmed answer to "where was I before the
--- log starts", same role node_tiers plays for gathering. Only ever fills in
--- that one leading gap; once a character has any real zone_change logged,
--- everything after it resolves normally without needing an entry here.
+-- log starts". Only ever fills in that one leading gap; once a character
+-- has any real zone_change logged, everything after it resolves normally
+-- without needing an entry here.
 CREATE TABLE IF NOT EXISTS zone_start_overrides (
     character_id INT NOT NULL PRIMARY KEY,
     zone VARCHAR(255) NOT NULL,
     note VARCHAR(255) NULL,
     confirmed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (character_id) REFERENCES characters(id)
-) ENGINE=InnoDB;
-
--- Gathering "eras": a timestamp boundary, not a data partition. Nothing
--- gathering-related is ever deleted to start a new baseline (e.g. after a
--- patch changes drop rates/yields) -- ending the current era and starting a
--- new one just changes what /gathering shows by default. A gather event
--- "belongs" to whichever era's [started_at, ended_at) window contains its
--- own ts, so this works correctly even for a file that straddles the patch
--- boundary -- old lines fall in the old era, new lines in the new one,
--- based on in-game time, not import time. Exactly one row should have
--- ended_at IS NULL at a time (the active era).
-CREATE TABLE IF NOT EXISTS gather_eras (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    name VARCHAR(128) NOT NULL,
-    started_at DATETIME(3) NOT NULL,
-    ended_at DATETIME(3) NULL,
-    note VARCHAR(512) NULL
 ) ENGINE=InnoDB;
 

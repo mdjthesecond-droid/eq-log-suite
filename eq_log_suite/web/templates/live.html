@@ -67,13 +67,10 @@ imported log -- see <a href="/encounters">Encounters</a>.</p>
   let lastId = {{ start_id }};
 
   // ---- Active encounter boundaries mirror the server-side rule in
-  // _derive_gap_based_encounters(): EQ2 has explicit "You start/stop
-  // fighting." (combat_state) markers, used directly. EQL has none, so a
-  // combat action auto-opens an encounter if one isn't already active, and
-  // it closes on a hard stop (your death, escape, zone change) or after
-  // EQL_OUT_OF_COMBAT_SECONDS of no further action. Applying the same
-  // hard-stop/timeout rule to EQ2 too is harmless -- its explicit stop event
-  // always arrives well before either would fire during real combat.
+  // _derive_gap_based_encounters(): a combat action auto-opens an encounter
+  // if one isn't already active, and it closes on a hard stop (your death,
+  // escape, zone change) or after EQL_OUT_OF_COMBAT_SECONDS of no further
+  // action.
   const EQL_OUT_OF_COMBAT_SECONDS = 5;
   const DAMAGE_EVENT_TYPES = new Set(["melee", "spell_damage", "ability_damage"]);
   const enc = { active: false, startTs: null, lastTs: null,
@@ -284,10 +281,6 @@ imported log -- see <a href="/encounters">Encounters</a>.</p>
       lastId = e.id;
       if (e.source_type === "you" && e.event_type === "zone_change" && e.target_name) {
         document.getElementById("zone-value").textContent = e.target_name;
-      }
-      if (e.event_type === "combat_state" && e.source_type === "you") {
-        if (e.verb === "start") startEncounter(Date.now());
-        else if (e.verb === "stop") stopEncounter(Date.now());
       }
       // EQL hard stops: your death, escape, or a zone change end the
       // encounter immediately, same as the server-side is_hard_stop rows.

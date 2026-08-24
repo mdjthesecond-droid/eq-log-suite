@@ -6,33 +6,6 @@ import json
 from eq_log_suite.parsers.base import normalize_actor_name
 
 
-class RareGatherTagger:
-    """Correlates EQ2's 'You have found a rare item!' marker line with the
-    gather event that immediately follows it, tagging that gather event's
-    `outcome` (e.g. 'rare') so rarity is queryable directly on the gather
-    row instead of needing a manual line-adjacency join later.
-
-    Stateful across a sequential run through one log source's lines --
-    each importer run / tailer task should use its own instance.
-    """
-
-    def __init__(self):
-        self._pending_tier = None
-
-    def apply(self, event):
-        if event is None:
-            return event
-        if event.event_type == "rare_found":
-            self._pending_tier = event.outcome
-            return event
-        if self._pending_tier is not None:
-            if event.event_type == "gather":
-                event.outcome = self._pending_tier
-            # Only the line immediately after the marker counts, matched or not.
-            self._pending_tier = None
-        return event
-
-
 def insert_batch(conn, game_id, character_id, log_source_id, events_batch, raw_batch):
     """events_batch: list of (idx, ParsedEvent).
     raw_batch: list of (idx, line_no, ts, raw_text) -- one entry per line read,

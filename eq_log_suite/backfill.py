@@ -16,7 +16,6 @@ import argparse
 import json
 
 from eq_log_suite import db
-from eq_log_suite.ingest import RareGatherTagger
 from eq_log_suite.parsers.registry import get_parser
 
 BATCH_SIZE = 500
@@ -33,7 +32,6 @@ def backfill(log_source_id: int):
         game_code = cur.fetchone()["code"]
 
     parser_cls = get_parser(game_code)
-    rare_tagger = RareGatherTagger()  # only meaningful for eq2 today; harmless elsewhere
     game_id = log_source["game_id"]
     character_id = log_source["character_id"]
 
@@ -73,7 +71,7 @@ def backfill(log_source_id: int):
         batch = []
 
     for row in rows:
-        event = rare_tagger.apply(parser_cls.parse_line(row["raw_text"], line_no=row["line_no"]))
+        event = parser_cls.parse_line(row["raw_text"], line_no=row["line_no"])
         if event is not None:
             batch.append((row["id"], event))
         if len(batch) >= BATCH_SIZE:

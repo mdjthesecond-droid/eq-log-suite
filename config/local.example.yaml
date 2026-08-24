@@ -6,11 +6,9 @@ database:
   password: "CHANGE_ME"
   name: eqlogs
 
-# Folders the tailer auto-scans for new/rotated log files (new character,
-# new server, or the game creating a fresh file via a /log toggle). Scanned
-# once at startup and every few minutes while the tailer runs -- see
-# eq_log_suite/discovery.py.
+# Folders the tailer auto-scans for new/rotated log files (new character or
+# new server). Scanned once at startup and every few minutes while the
+# tailer runs -- see eq_log_suite/discovery.py.
 log_roots:
   eql: /home/myself/eql/Logs
-  eq2: /home/myself/eq2/logs
   eq: /home/myself/eq/Logs

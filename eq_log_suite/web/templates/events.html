@@ -3,7 +3,7 @@
 {% block content %}
 <h1>Browse Events</h1>
 <form method="get" action="/events">
-  <input name="game" placeholder="game (eql/eq2/eq)" value="{{ filters.game }}">
+  <input name="game" placeholder="game (eql/eq)" value="{{ filters.game }}">
   <input name="character" placeholder="character" value="{{ filters.character }}">
   <input name="event_type" placeholder="event_type" value="{{ filters.event_type }}">
   <input name="source" placeholder="source contains" value="{{ filters.source }}">

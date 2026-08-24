@@ -26,7 +26,7 @@ templates = Jinja2Templates(directory=BASE_DIR / "templates")
 # before it. Falls back to zone_start_overrides (a one-time, per-character,
 # user-confirmed answer -- see schema.sql) for the leading gap before a
 # character's first-ever logged zone_change, where there's nothing to
-# correlate against. Used identically by /loot, /gathering, and /quests.
+# correlate against. Used identically by /loot and /quests.
 _ZONE_LOOKUP_EXPR = (
     "COALESCE("
     "(SELECT z.target_name FROM events z WHERE z.event_type='zone_change' "
@@ -105,13 +105,6 @@ def home(request: Request):
 def eql_hub(request: Request):
     return templates.TemplateResponse(request, "game_hub.html", {
         "game": "eql", "game_label": "EQ Legends",
-    })
-
-
-@app.get("/eq2", response_class=HTMLResponse)
-def eq2_hub(request: Request):
-    return templates.TemplateResponse(request, "game_hub.html", {
-        "game": "eq2", "game_label": "EverQuest II",
     })
 
 
@@ -196,129 +189,6 @@ def events_browse(
     })
 
 
-def _compute_gathering(game, character="", zone="", node="", item="", skill="", era="current"):
-    conn = db.get_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM gather_eras ORDER BY started_at DESC")
-            eras = cur.fetchall()
-    finally:
-        conn.close()
-
-    clauses, params = ["ev.event_type = 'gather'", "g.code = %s"], [game]
-    if character:
-        clauses.append("c.name = %s"); params.append(character)
-    if node:
-        clauses.append("JSON_UNQUOTE(JSON_EXTRACT(ev.extra, '$.node')) LIKE %s"); params.append(f"%{node}%")
-    if item:
-        clauses.append("ev.target_name LIKE %s"); params.append(f"%{item}%")
-    if skill:
-        clauses.append("ev.verb = %s"); params.append(skill)
-
-    # "current" (default) = the active era (ended_at IS NULL); "all" = no
-    # boundary at all; anything else = a specific past era's [start, end).
-    selected_era = None
-    if era == "current":
-        selected_era = next((e for e in eras if e["ended_at"] is None), None)
-    elif era != "all":
-        selected_era = next((e for e in eras if str(e["id"]) == era), None)
-    if selected_era:
-        clauses.append("ev.ts >= %s"); params.append(selected_era["started_at"])
-        if selected_era["ended_at"]:
-            clauses.append("ev.ts < %s"); params.append(selected_era["ended_at"])
-
-    where = f"WHERE {' AND '.join(clauses)}"
-    zone_having = "HAVING zone LIKE %s" if zone else ""
-    zone_param = [f"%{zone}%"] if zone else []
-    sql = (
-        # No explicit "tier" exists in the log text -- node_tiers is a
-        # user-curated node -> tier mapping (see schema.sql), and any node
-        # missing from it shows up flagged so nothing goes unnoticed, for
-        # any node past or future. zone is a secondary hint (the zone you
-        # were in at the moment of each pull, same technique as /zones),
-        # useful context while you're identifying a new node's tier.
-        # Gather yields also come from a small set of fixed quantity tiers
-        # per item, not a continuous range -- grouping by amount too
-        # (instead of averaging it away) surfaces each tier as its own
-        # distinct outcome with its own real chance, e.g. "2x tuber strand"
-        # and "7x tuber strand" as separate rows rather than one row
-        # averaging to 3.9.
-        "WITH per_event AS ("
-        "  SELECT JSON_UNQUOTE(JSON_EXTRACT(ev.extra, '$.node')) AS node, "
-        f"    {_ZONE_LOOKUP_EXPR} AS zone, "
-        "    ev.target_name AS item, ev.amount AS qty, ev.verb AS skill, ev.outcome AS outcome "
-        "  FROM events ev JOIN games g ON ev.game_id=g.id JOIN characters c ON ev.character_id=c.id "
-        f"  {where}"
-        "), grouped AS ("
-        "  SELECT node, MAX(zone) AS zone, item, qty, skill, "
-        "    COUNT(*) AS pulls, SUM(outcome = 'rare') AS rare_pulls "
-        "  FROM per_event GROUP BY node, item, qty, skill"
-        ") "
-        "SELECT grp.node, nt.tier, grp.zone, grp.item, grp.qty, grp.skill, grp.pulls, grp.rare_pulls, "
-        "ROUND(grp.pulls / SUM(grp.pulls) OVER (PARTITION BY grp.node) * 100, 2) AS chance_pct "
-        "FROM grouped grp "
-        "LEFT JOIN node_tiers nt ON nt.node = grp.node "
-        f"{zone_having} "
-        "ORDER BY (nt.tier IS NULL) DESC, grp.node, chance_pct DESC"
-    )
-
-    conn = db.get_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(sql, params + zone_param)
-            rows = cur.fetchall()
-            cur.execute("SELECT DISTINCT verb FROM events ev JOIN games g ON ev.game_id=g.id "
-                        "WHERE ev.event_type='gather' AND g.code = %s ORDER BY verb", (game,))
-            skills = [r["verb"] for r in cur.fetchall()]
-    finally:
-        conn.close()
-
-    unidentified_nodes = sorted({r["node"] for r in rows if r["tier"] is None})
-
-    return {
-        "rows": rows,
-        "skills": skills,
-        "unidentified_nodes": unidentified_nodes,
-        "eras": eras,
-        "selected_era": era,
-        "filters": {"character": character, "zone": zone, "node": node, "item": item, "skill": skill},
-    }
-
-
-@app.get("/gathering/eq2", response_class=HTMLResponse)
-def gathering_report_eq2(
-    request: Request, character: str = "", zone: str = "", node: str = "",
-    item: str = "", skill: str = "", era: str = "current",
-):
-    ctx = _compute_gathering("eq2", character, zone, node, item, skill, era)
-    ctx.update({"game": "eq2", "game_label": "EverQuest II", "unresolved_zone_starts": _unresolved_zone_starts("eq2")})
-    return templates.TemplateResponse(request, "gathering.html", ctx)
-
-
-@app.post("/gathering/set-tier")
-def gathering_set_tier(node: str = Form(...), tier: str = Form(...), note: str = Form(""), game: str = Form("eq2")):
-    conn = db.get_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO node_tiers (node, tier, note) VALUES (%s,%s,%s) "
-                "ON DUPLICATE KEY UPDATE tier=VALUES(tier), note=VALUES(note)",
-                (node, tier, note or None),
-            )
-        conn.commit()
-    finally:
-        conn.close()
-    return RedirectResponse(f"/gathering/{game}", status_code=303)
-
-
-@app.post("/gathering/new-era")
-def gathering_new_era(name: str = Form(...), note: str = Form(""), game: str = Form("eq2")):
-    from eq_log_suite.gather_eras import new_era
-
-    new_era(name, note or None, at=None)
-    return RedirectResponse(f"/gathering/{game}", status_code=303)
-
-
 LOOT_RESULT_LIMIT = 50
 
 
@@ -345,8 +215,8 @@ def _compute_loot(game, npc="", item="", zone=""):
     # Future extension point: once items have a curated type (trash/quest/
     # tradeskill/weapon slot+type/armor slot+type -- not built yet), that'd
     # join in here (e.g. an `item_info` table keyed on item name, same
-    # shape as node_tiers/npc_info/zone_info) and surface as a filter/column
-    # alongside npc/item/zone.
+    # shape as npc_info/zone_info) and surface as a filter/column alongside
+    # npc/item/zone.
     loot_clauses, loot_params = ["ev.event_type='loot'", "g.code = %s"], [game]
     if npc:
         loot_clauses.append("ev.source_name LIKE %s"); loot_params.append(f"%{npc}%")
@@ -512,18 +382,6 @@ def loot_report_eq(request: Request, npc: str = "", item: str = "", zone: str = 
     })
 
 
-@app.get("/loot/eq2", response_class=HTMLResponse)
-def loot_report_eq2(request: Request, npc: str = "", item: str = "", zone: str = ""):
-    rows, truncated = _compute_loot("eq2", npc, item, zone)
-    return templates.TemplateResponse(request, "loot.html", {
-        "rows": rows,
-        "game": "eq2",
-        "game_label": "EverQuest II",
-        "truncated": truncated,
-        "unresolved_zone_starts": _unresolved_zone_starts("eq2"),
-        "filters": {"npc": npc, "item": item, "zone": zone},
-    })
-
 
 def _compute_quests(game, character="", quest="", zone="", npc=""):
     inner_clauses, inner_params = ["g.code = %s"], [game]
@@ -543,8 +401,8 @@ def _compute_quests(game, character="", quest="", zone="", npc=""):
     sql = (
         # zone/npc aren't stated on the quest-completion line itself --
         # correlate against whichever zone_change/hail happened most
-        # recently before it for that character (same technique /gathering
-        # and /zones already use). npc is a best-effort "who was I probably
+        # recently before it for that character (same technique /zones
+        # already uses). npc is a best-effort "who was I probably
         # talking to" via the last NPC you hailed, not a guaranteed turn-in
         # target -- quest chains can involve hailing several NPCs before
         # the actual completion.
@@ -744,7 +602,7 @@ def _compute_dialogue(game, character="", npc="", zone="", exclude_chatter=False
     # instead it's a flat chronological transcript of hail/say/npc_dialogue/
     # reward events, filterable by npc/zone, so a real dialogue tree emerges
     # from repeated visits over time. zone is correlated the same way
-    # /loot, /gathering, and EQ2's /quests already do.
+    # /loot already does.
     inner_clauses, inner_params = ["g.code = %s"], [game]
     if character:
         inner_clauses.append("c.name = %s"); inner_params.append(character)
@@ -943,16 +801,6 @@ def tasks_report_eq(request: Request, character: str = "", task: str = "", npc: 
     })
 
 
-@app.get("/quests/eq2", response_class=HTMLResponse)
-def quests_report_eq2(request: Request, character: str = "", quest: str = "", zone: str = "", npc: str = ""):
-    rows = _compute_quests("eq2", character, quest, zone, npc)
-    return templates.TemplateResponse(request, "quests.html", {
-        "rows": rows, "game": "eq2", "game_label": "EverQuest II",
-        "unresolved_zone_starts": _unresolved_zone_starts("eq2"),
-        "filters": {"character": character, "quest": quest, "zone": zone, "npc": npc},
-    })
-
-
 def _compute_attack_breakdown(conn, direction, character="", game="", start_ts="", end_ts=""):
     """Per-verb (melee attack type or spell name) combat breakdown: hit/crit
     rate, evasion (dodge/parry/block/riposte) rate, resist rate (outgoing
@@ -1055,11 +903,6 @@ def attacks_breakdown_eql(request: Request, character: str = "", start_ts: str =
 @app.get("/attacks/eq", response_class=HTMLResponse)
 def attacks_breakdown_eq(request: Request, character: str = "", start_ts: str = "", end_ts: str = ""):
     return _render_attacks(request, "eq", "EverQuest", character, start_ts, end_ts)
-
-
-@app.get("/attacks/eq2", response_class=HTMLResponse)
-def attacks_breakdown_eq2(request: Request, character: str = "", start_ts: str = "", end_ts: str = ""):
-    return _render_attacks(request, "eq2", "EverQuest II", character, start_ts, end_ts)
 
 
 def _compute_zones(game, character="", zone="", start_ts="", end_ts=""):
@@ -1218,17 +1061,6 @@ def zones_report_eq(request: Request, character: str = "", zone: str = "", start
     rows = _compute_zones("eq", character, zone, start_ts, end_ts) if searched else []
     return templates.TemplateResponse(request, "zones.html", {
         "rows": rows, "game": "eq", "game_label": "EverQuest",
-        "filters": {"character": character, "zone": zone, "start_ts": start_ts, "end_ts": end_ts},
-        "searched": searched,
-    })
-
-
-@app.get("/zones/eq2", response_class=HTMLResponse)
-def zones_report_eq2(request: Request, character: str = "", zone: str = "", start_ts: str = "", end_ts: str = ""):
-    searched = bool(character or zone or start_ts or end_ts)
-    rows = _compute_zones("eq2", character, zone, start_ts, end_ts) if searched else []
-    return templates.TemplateResponse(request, "zones.html", {
-        "rows": rows, "game": "eq2", "game_label": "EverQuest II",
         "filters": {"character": character, "zone": zone, "start_ts": start_ts, "end_ts": end_ts},
         "searched": searched,
     })
@@ -1797,14 +1629,6 @@ def zoneinfo_list_eql(request: Request):
     })
 
 
-@app.get("/zoneinfo/eq2", response_class=HTMLResponse)
-def zoneinfo_list_eq2(request: Request):
-    rows = _compute_zone_list("eq2")
-    return templates.TemplateResponse(request, "zoneinfo_list.html", {
-        "rows": rows, "game": "eq2", "game_label": "EverQuest II",
-    })
-
-
 @app.get("/zoneinfo/eq", response_class=HTMLResponse)
 def zoneinfo_list_eq(request: Request):
     rows = _compute_zone_list("eq")
@@ -1832,11 +1656,6 @@ def _render_zoneinfo_detail(request, game, game_label, zone, tier, solo):
 @app.get("/zoneinfo/eql/detail", response_class=HTMLResponse)
 def zoneinfo_detail_eql(request: Request, zone: str, tier: str = "all", solo: str = "any"):
     return _render_zoneinfo_detail(request, "eql", "EQ Legends", zone, tier, solo)
-
-
-@app.get("/zoneinfo/eq2/detail", response_class=HTMLResponse)
-def zoneinfo_detail_eq2(request: Request, zone: str, tier: str = "all", solo: str = "any"):
-    return _render_zoneinfo_detail(request, "eq2", "EverQuest II", zone, tier, solo)
 
 
 @app.get("/zoneinfo/eq/detail", response_class=HTMLResponse)
@@ -2198,15 +2017,6 @@ def npcs_list_eql(request: Request, search: str = "", zone: str = ""):
     })
 
 
-@app.get("/npcs/eq2", response_class=HTMLResponse)
-def npcs_list_eq2(request: Request, search: str = "", zone: str = ""):
-    rows = _compute_npc_list("eq2", search, zone) if (search or zone) else []
-    return templates.TemplateResponse(request, "npc_list.html", {
-        "rows": rows, "game": "eq2", "game_label": "EverQuest II",
-        "search": search, "zone": zone, "searched": bool(search or zone),
-    })
-
-
 @app.get("/npcs/eq", response_class=HTMLResponse)
 def npcs_list_eq(request: Request, search: str = "", zone: str = ""):
     rows = _compute_npc_list("eq", search, zone) if (search or zone) else []
@@ -2221,14 +2031,6 @@ def npc_detail_eql(request: Request, npc: str, tier: str = "all"):
     detail = _compute_npc_detail("eql", npc, tier)
     return templates.TemplateResponse(request, "npc_detail.html", {
         "game": "eql", "game_label": "EQ Legends", **detail,
-    })
-
-
-@app.get("/npcs/eq2/detail", response_class=HTMLResponse)
-def npc_detail_eq2(request: Request, npc: str, tier: str = "all"):
-    detail = _compute_npc_detail("eq2", npc, tier)
-    return templates.TemplateResponse(request, "npc_detail.html", {
-        "game": "eq2", "game_label": "EverQuest II", **detail,
     })
 
 
@@ -2273,60 +2075,12 @@ def events_since(last_id: int, limit: int = 200):
 
 
 DAMAGE_EVENT_TYPES_SQL = "('melee','spell_damage','ability_damage')"
-# EQ2 toggles "You stop fighting."/"You start fighting." between individual
-# mobs in the same pull (observed: as little as 3s apart for back-to-back
-# kills), which reads as one continuous fight to the player but as several
-# separate combat_state pairs in the log. Merge consecutive pairs into one
-# encounter when the gap between a stop and the next start is small --
-# matches the same "still the same fight" convention as COMBAT_TIMEOUT_SECONDS
-# in tailer.py's live DPS tracker.
-ENCOUNTER_MERGE_GAP_SECONDS = 6
 
-
-def _merge_encounters(marker_rows):
-    """marker_rows: combat_state rows (character_id, character_name, game,
-    ts, verb), ordered by ts, for potentially several characters interleaved.
-    Returns merged (character_id, character_name, game, start_ts, stop_ts)
-    tuples, stop_ts=None meaning still active."""
-    open_encounters: dict[int, dict] = {}  # character_id -> in-progress encounter
-    finished = []
-
-    for row in marker_rows:
-        cid = row["character_id"]
-        current = open_encounters.get(cid)
-        if row["verb"] == "start":
-            if current is None:
-                open_encounters[cid] = {
-                    "character_id": cid, "character_name": row["character_name"],
-                    "game": row["game"], "start_ts": row["ts"], "stop_ts": None,
-                }
-            elif current["stop_ts"] is not None:
-                gap = (row["ts"] - current["stop_ts"]).total_seconds()
-                if gap <= ENCOUNTER_MERGE_GAP_SECONDS:
-                    current["stop_ts"] = None  # merge: still the same encounter
-                else:
-                    finished.append(current)
-                    open_encounters[cid] = {
-                        "character_id": cid, "character_name": row["character_name"],
-                        "game": row["game"], "start_ts": row["ts"], "stop_ts": None,
-                    }
-            # else: a 'start' while already active (no intervening stop) -- ignore, already open
-        elif row["verb"] == "stop" and current is not None and current["stop_ts"] is None:
-            current["stop_ts"] = row["ts"]
-
-    for current in open_encounters.values():
-        finished.append(current)  # includes any still-active (stop_ts=None) encounter
-    finished.sort(key=lambda e: e["start_ts"], reverse=True)
-    return finished
-
-
-# EQL has no "You stop fighting." marker at all (unlike EQ2), so its
-# encounters have to be derived purely from activity: out of combat is 5
-# seconds since the last combat action, same idea as the DPS meter's own
-# pause timeout (COMBAT_TIMEOUT_SECONDS in tailer.py), just EQL-specific gap
-# length -- OR immediately, regardless of the timer, on your own death,
-# using Escape, or a zone change (hard stops). Games with an explicit marker
-# (EQ2) use _merge_encounters instead, which is more precise when available.
+# No parser has a "You stop fighting." marker, so encounters are derived
+# purely from activity: out of combat is 5 seconds since the last combat
+# action, same idea as the DPS meter's own pause timeout
+# (COMBAT_TIMEOUT_SECONDS in tailer.py) -- OR immediately, regardless of the
+# timer, on your own death, using Escape, or a zone change (hard stops).
 EQL_OUT_OF_COMBAT_SECONDS = 5
 
 
@@ -2394,21 +2148,13 @@ def _compute_encounters(character="", start_ts="", end_ts="", npc="", limit=30, 
     conn = db.get_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT ev.character_id, c.name AS character_name, g.code AS game, ev.ts, ev.verb "
-                "FROM events ev JOIN characters c ON ev.character_id=c.id JOIN games g ON g.id=c.game_id "
-                f"WHERE ev.event_type='combat_state' {where} ORDER BY ev.ts",
-                params,
-            )
-            markers = cur.fetchall()
-
             # Regular activity: extends the encounter, subject to the
             # gap_seconds timeout. Damage either direction, or a kill BY you
             # (an NPC's death doesn't end your combat -- there may be adds).
             cur.execute(
                 "SELECT ev.character_id, c.name AS character_name, g.code AS game, ev.ts, 0 AS is_hard_stop "
                 "FROM events ev JOIN characters c ON ev.character_id=c.id JOIN games g ON g.id=c.game_id "
-                "WHERE g.code != 'eq2' AND ("
+                "WHERE ("
                 f"  (ev.event_type IN {DAMAGE_EVENT_TYPES_SQL} AND (ev.source_type='you' OR ev.target_type='you'))"
                 "  OR (ev.event_type='death' AND ev.source_type='you')"
                 f") {where} "
@@ -2417,7 +2163,7 @@ def _compute_encounters(character="", start_ts="", end_ts="", npc="", limit=30, 
                 # the timer -- your own death, Escape, or a zone change.
                 "SELECT ev.character_id, c.name AS character_name, g.code AS game, ev.ts, 1 AS is_hard_stop "
                 "FROM events ev JOIN characters c ON ev.character_id=c.id JOIN games g ON g.id=c.game_id "
-                "WHERE g.code != 'eq2' AND ("
+                "WHERE ("
                 "  (ev.event_type='death' AND ev.target_type='you')"
                 "  OR ev.event_type='escape'"
                 "  OR (ev.event_type='zone_change' AND ev.source_type='you')"
@@ -2448,7 +2194,7 @@ def _compute_encounters(character="", start_ts="", end_ts="", npc="", limit=30, 
                 for row in cur.fetchall():
                     npc_hits.setdefault(row["character_id"], []).append(row["ts"])
 
-        encounters = _merge_encounters(markers) + _derive_gap_based_encounters(activity, EQL_OUT_OF_COMBAT_SECONDS)
+        encounters = _derive_gap_based_encounters(activity, EQL_OUT_OF_COMBAT_SECONDS)
 
         if npc:
             def _touches_npc(e):
@@ -3496,7 +3242,7 @@ def import_rescan(request: Request):
 
     log_roots = db.config().get("log_roots", {})
     new_sources = discovery.scan_and_import(
-        log_roots.get("eql", ""), log_roots.get("eq2", ""), log_roots.get("eq", "")
+        log_roots.get("eql", ""), log_roots.get("eq", "")
     )
 
     tailer_notified = False

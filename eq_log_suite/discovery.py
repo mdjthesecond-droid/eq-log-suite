@@ -1,8 +1,7 @@
 """Auto-discovers new/rotated EQ-family log files (a new character-server
-combo, or EQ2 creating a fresh file via a /log toggle) and starts tracking
-them automatically -- imports the file and marks it live, with no manual
-`importer.py --live` step needed. Called once at tailer startup and on a
-recurring interval while it runs (see tailer.py).
+combo) and starts tracking them automatically -- imports the file and marks
+it live, with no manual `importer.py --live` step needed. Called once at
+tailer startup and on a recurring interval while it runs (see tailer.py).
 
 Only one log_source should be "live" per character at a time. Which one
 that is gets resolved by file mtime (the actual signal for "which file is
@@ -21,11 +20,6 @@ from eq_log_suite import db
 from eq_log_suite.importer import guess_character_from_filename, guess_server_from_filename
 
 EQLOG_NAME_RE = re.compile(r"^eqlog_.*\.txt$", re.IGNORECASE)
-# EQ2's default log filename (bare "/log" with no custom name) embeds the
-# character directly, same idea as EQL's eqlog_<Character>_<Server>.txt --
-# e.g. "eq2log_Cheerfulness.txt". A custom "/log <name>" (e.g. "testers.txt")
-# doesn't encode a character, so falls back to the same-server-folder guess.
-EQ2LOG_DEFAULT_NAME_RE = re.compile(r"^eq2log_(?P<character>.+)\.txt$", re.IGNORECASE)
 
 
 def _discover_eql(root: str) -> list[str]:
@@ -44,28 +38,10 @@ def _discover_eq(root: str) -> list[str]:
     return [str(p) for p in sorted(root_path.glob("*.txt")) if EQLOG_NAME_RE.match(p.name)]
 
 
-def _discover_eq2(root: str) -> list[str]:
-    root_path = Path(root)
-    if not root_path.is_dir():
-        return []
-    return [str(p) for p in sorted(root_path.rglob("*.txt"))]
-
-
 def _already_tracked(conn) -> set[str]:
     with conn.cursor() as cur:
         cur.execute("SELECT file_path FROM log_sources")
         return {row["file_path"] for row in cur.fetchall()}
-
-
-def _existing_eq2_character_for_server(conn, server: str) -> str | None:
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT c.name FROM characters c JOIN games g ON c.game_id=g.id "
-            "WHERE g.code='eq2' AND c.server=%s LIMIT 1",
-            (server,),
-        )
-        row = cur.fetchone()
-        return row["name"] if row else None
 
 
 def _import_new_file(path: str, game_code: str, character_name: str, server: str | None) -> dict:
@@ -113,7 +89,7 @@ def _resolve_live_status(character_ids: set[int]) -> None:
         conn.close()
 
 
-def scan_and_import(eql_root: str, eq2_root: str, eq_root: str = "") -> list[dict]:
+def scan_and_import(eql_root: str, eq_root: str = "") -> list[dict]:
     """Returns the (possibly now-live) log_sources rows for any
     newly-discovered files."""
     conn = db.get_connection()
@@ -140,26 +116,6 @@ def scan_and_import(eql_root: str, eq2_root: str, eq_root: str = "") -> list[dic
         character = guess_character_from_filename(path) or "Unknown"
         server = guess_server_from_filename(path)
         row = _import_new_file(path, "eq", character, server)
-        newly_added.append(row)
-        touched_character_ids.add(row["character_id"])
-
-    for path in _discover_eq2(eq2_root):
-        if path in tracked:
-            continue
-        server = Path(path).parent.name  # server-named subfolder, e.g. "Halls of Fate"
-        name_match = EQ2LOG_DEFAULT_NAME_RE.match(Path(path).name)
-        if name_match:
-            character = name_match.group("character")
-        else:
-            # a custom "/log <name>" file (e.g. "testers.txt") doesn't encode
-            # a character -- assume whichever character is already known on
-            # this same server folder.
-            conn2 = db.get_connection()
-            try:
-                character = _existing_eq2_character_for_server(conn2, server) or "Unknown"
-            finally:
-                conn2.close()
-        row = _import_new_file(path, "eq2", character, server)
         newly_added.append(row)
         touched_character_ids.add(row["character_id"])
 

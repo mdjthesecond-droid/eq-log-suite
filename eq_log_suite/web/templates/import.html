@@ -3,9 +3,8 @@
 {% block content %}
 <h1>Import a log file</h1>
 
-<p>New/rotated log files (new character, new server, EQ2 <code>/log</code> toggles) are picked up
-automatically every 5 minutes by the tailer -- this button skips the wait and tells it to check
-right now.</p>
+<p>New/rotated log files (new character, new server) are picked up automatically every 5 minutes
+by the tailer -- this button skips the wait and tells it to check right now.</p>
 <form method="post" action="/import/rescan">
   <button type="submit">Rescan log folders now</button>
 </form>
@@ -15,7 +14,6 @@ right now.</p>
   <select name="game">
     <option value="auto">auto-detect</option>
     <option value="eql">eql</option>
-    <option value="eq2">eq2</option>
     <option value="eq">eq</option>
   </select>
   <input name="character" placeholder="character (optional, guessed from filename)">

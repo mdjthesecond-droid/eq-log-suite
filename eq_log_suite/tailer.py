@@ -190,7 +190,6 @@ async def tail_log_source(conn, log_source, broadcaster: OverlayBroadcaster):
     alert_engine = AlertEngine(conn, log_source["game_id"], broadcast=broadcaster.send)
     dps = DPSTracker(label=f"{character_name} ({game_code})")
     combat = CombatTracker(label=f"{character_name} ({game_code})")
-    rare_tagger = ingest.RareGatherTagger()
 
     path = log_source["file_path"]
     log_source_id = log_source["id"]
@@ -234,7 +233,7 @@ async def tail_log_source(conn, log_source, broadcaster: OverlayBroadcaster):
 
             offset += len(line_bytes)
             line = line_bytes.decode("utf-8", errors="replace").rstrip("\r\n")
-            event = rare_tagger.apply(parser_cls.parse_line(line, line_no=line_no))
+            event = parser_cls.parse_line(line, line_no=line_no)
 
             events_batch = [(0, event)] if event is not None else []
             raw_batch = [(0, line_no, event.ts if event else None, line)]
@@ -290,12 +289,12 @@ def _character_name_for(conn, character_id: int) -> str:
         return cur.fetchone()["name"]
 
 
-async def discovery_loop(eql_root, eq2_root, eq_root, broadcaster, running_log_source_ids, rescan_event: asyncio.Event):
-    """Periodically re-scans the EQL/EQ2/EQ log folders for new or rotated
-    files (a new character, a new server, or the game creating a fresh file
-    via a /log toggle) and starts tailing them without a restart. Also wakes
-    up immediately (instead of waiting for the next timer tick) whenever
-    rescan_event is set -- see trigger_rescan()/SIGUSR1 handling below."""
+async def discovery_loop(eql_root, eq_root, broadcaster, running_log_source_ids, rescan_event: asyncio.Event):
+    """Periodically re-scans the EQL/EQ log folders for new or rotated files
+    (a new character or a new server) and starts tailing them without a
+    restart. Also wakes up immediately (instead of waiting for the next
+    timer tick) whenever rescan_event is set -- see trigger_rescan()/SIGUSR1
+    handling below."""
     while True:
         try:
             await asyncio.wait_for(rescan_event.wait(), timeout=DISCOVERY_INTERVAL_SECONDS)
@@ -304,7 +303,7 @@ async def discovery_loop(eql_root, eq2_root, eq_root, broadcaster, running_log_s
         rescan_event.clear()
 
         try:
-            new_sources = discovery.scan_and_import(eql_root, eq2_root, eq_root)
+            new_sources = discovery.scan_and_import(eql_root, eq_root)
         except Exception as e:
             print(f"[tailer] discovery scan failed: {type(e).__name__}: {e}")
             continue
@@ -317,16 +316,16 @@ async def discovery_loop(eql_root, eq2_root, eq_root, broadcaster, running_log_s
             asyncio.create_task(tail_log_source(task_conn, log_source, broadcaster))
 
 
-async def main_async(socket_path: str, eql_root: str | None, eq2_root: str | None, eq_root: str | None = None):
+async def main_async(socket_path: str, eql_root: str | None, eq_root: str | None = None):
     PID_PATH.parent.mkdir(parents=True, exist_ok=True)
     PID_PATH.write_text(str(os.getpid()))
 
     rescan_event = asyncio.Event()
     asyncio.get_running_loop().add_signal_handler(signal.SIGUSR1, rescan_event.set)
 
-    if eql_root or eq2_root or eq_root:
+    if eql_root or eq_root:
         print("[tailer] scanning for new/rotated log files...")
-        discovery.scan_and_import(eql_root or "", eq2_root or "", eq_root or "")
+        discovery.scan_and_import(eql_root or "", eq_root or "")
 
     conn = db.get_connection()
     with conn.cursor() as cur:
@@ -352,9 +351,9 @@ async def main_async(socket_path: str, eql_root: str | None, eq2_root: str | Non
         task_conn = db.get_connection()
         tasks.append(asyncio.create_task(tail_log_source(task_conn, log_source, broadcaster)))
 
-    if eql_root or eq2_root or eq_root:
+    if eql_root or eq_root:
         tasks.append(asyncio.create_task(
-            discovery_loop(eql_root or "", eq2_root or "", eq_root or "", broadcaster, running_log_source_ids, rescan_event)
+            discovery_loop(eql_root or "", eq_root or "", broadcaster, running_log_source_ids, rescan_event)
         ))
 
     await asyncio.gather(*tasks)
@@ -365,7 +364,7 @@ def main():
     ap.add_argument("--socket", default=DEFAULT_SOCKET_PATH)
     args = ap.parse_args()
     log_roots = db.config().get("log_roots", {})
-    asyncio.run(main_async(args.socket, log_roots.get("eql"), log_roots.get("eq2"), log_roots.get("eq")))
+    asyncio.run(main_async(args.socket, log_roots.get("eql"), log_roots.get("eq")))
 
 
 if __name__ == "__main__":

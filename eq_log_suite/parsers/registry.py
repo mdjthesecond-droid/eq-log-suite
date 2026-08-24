@@ -3,12 +3,10 @@ from typing import Optional
 
 from eq_log_suite.parsers.base import GameParser
 from eq_log_suite.parsers.eq import EQParser
-from eq_log_suite.parsers.eq2 import EQ2Parser
 from eq_log_suite.parsers.eq_legends import EQLegendsParser
 
 PARSERS: dict[str, type[GameParser]] = {
     EQLegendsParser.game_code: EQLegendsParser,
-    EQ2Parser.game_code: EQ2Parser,
     EQParser.game_code: EQParser,
 }
 

@@ -17,7 +17,7 @@ from eq_log_suite.parsers.registry import detect_parser, get_parser
 
 BATCH_SIZE = 500
 
-GAME_NAMES = {"eql": "EverQuest Legends", "eq2": "EverQuest II", "eq": "EverQuest"}
+GAME_NAMES = {"eql": "EverQuest Legends", "eq": "EverQuest"}
 
 
 def guess_character_from_filename(path: str) -> str | None:
@@ -58,7 +58,6 @@ def import_file(path: str, game_code: str | None, character_name: str | None, se
 
     total_count = 0
     parsed_count = 0
-    rare_tagger = ingest.RareGatherTagger()
 
     with open(path, "rb") as f:
         # Recompute the starting line number by counting newlines already
@@ -83,7 +82,7 @@ def import_file(path: str, game_code: str | None, character_name: str | None, se
             total_count += 1
             idx = total_count
 
-            event = rare_tagger.apply(parser_cls.parse_line(line, line_no=line_no))
+            event = parser_cls.parse_line(line, line_no=line_no)
             if event is not None:
                 parsed_count += 1
                 events_batch.append((idx, event))
@@ -106,7 +105,7 @@ def import_file(path: str, game_code: str | None, character_name: str | None, se
 def main():
     ap = argparse.ArgumentParser(description="Bulk-import an EQ-family log file into MySQL.")
     ap.add_argument("path")
-    ap.add_argument("--game", default="auto", help="eql | eq2 | auto (default: auto-detect)")
+    ap.add_argument("--game", default="auto", help="eql | eq | auto (default: auto-detect)")
     ap.add_argument("--character", default=None)
     ap.add_argument("--server", default=None)
     ap.add_argument("--live", action="store_true", help="mark this log_source for live tailing")
