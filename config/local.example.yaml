@@ -14,14 +14,3 @@ log_roots:
   eql: /home/myself/eql/Logs
   eq2: /home/myself/eq2/logs
   eq: /home/myself/eq/Logs
-
-# Folder eq_log_suite.item_capture_watcher polls for new item-window
-# screenshots to OCR. Deliberately a dedicated, manually-curated folder
-# (not EQL's own live screenshot function/folder) -- a full-screen capture
-# picks up chat/achievement noise and can jumble several overlapping item
-# tooltips together, which meant a lot of after-the-fact cleanup. Take a
-# tight, single-item screenshot (e.g. a rectangle-select screenshot tool)
-# and drop it here; the watcher still auto-OCRs anything that lands in this
-# folder, same as before -- only the source of screenshots changed.
-item_capture:
-  screenshot_dir: /home/myself/Pictures/eq_item_captures

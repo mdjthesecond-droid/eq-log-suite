@@ -5,5 +5,3 @@ pymysql
 dbutils
 pyyaml
 python-multipart
-pytesseract
-pillow

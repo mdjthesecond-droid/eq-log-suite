@@ -4,4 +4,3 @@ pkill -f "eq_log_suite\.tailer" 2>/dev/null && echo "Stopped tailer." || echo "T
 pkill -f "eq_log_suite\.overlay\.window" 2>/dev/null && echo "Stopped overlay." || echo "Overlay wasn't running."
 pkill -f "eq_log_suite\.overlay\.mangohud_writer" 2>/dev/null && echo "Stopped MangoHud alert writer." || echo "MangoHud alert writer wasn't running."
 pkill -f "uvicorn eq_log_suite.web.app:app" 2>/dev/null && echo "Stopped web UI." || echo "Web UI wasn't running."
-pkill -f "eq_log_suite\.item_capture_watcher" 2>/dev/null && echo "Stopped item capture watcher." || echo "Item capture watcher wasn't running."
