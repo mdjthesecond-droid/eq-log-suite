@@ -593,6 +593,21 @@ def _is_chatter_excluded_npc(name):
     return lower.startswith("translocator ")
 
 
+def _is_test_dummy(name):
+    # Overseer Rael's sparring-partner NPCs (confirmed real, 2026-08-24:
+    # Rael's own npc_dialogue lists 15 valid levels -- "[10], [15], [20],
+    # ..., [70]" -- spawned as "Test <spelled-out level>", e.g. "Test
+    # Fifty"/"Test Seventy", both confirmed real in the events table).
+    # Prefix-matched rather than hardcoding all 15 name variants -- robust
+    # to Rael's list changing, and "Test " (with the trailing space) doesn't
+    # collide with any real name in the data (e.g. "Testimony of Truth" has
+    # no space after "Test", so it's untouched). These have artificial
+    # unlimited HP for testing, so they're excluded wherever NPC health/
+    # level/rare stats get aggregated -- otherwise they'd skew a zone's
+    # level range or show up as meaningless "NPCs" on a Zone Info page.
+    return bool(name) and name.startswith("Test ")
+
+
 def _compute_dialogue(game, character="", npc="", zone="", exclude_chatter=False):
     # Classic EQ quests aren't structured turn-ins like EQ2's -- they're
     # branching NPC dialogue (bracketed [keywords] you echo back) plus
@@ -1109,6 +1124,8 @@ def _compute_zone_list(game):
 
     con_by_zone = {}
     for r in con_rows_raw:
+        if _is_test_dummy(r["npc"]):
+            continue
         zone = zone_at(r["character_id"], r["ts"])
         if not zone:
             continue
@@ -1120,6 +1137,8 @@ def _compute_zone_list(game):
 
     zone_npc_sets: dict = {}
     for r in npc_rows_raw:
+        if _is_test_dummy(r["source_name"]):
+            continue
         zone = zone_at(r["character_id"], r["ts"])
         if not zone:
             continue
@@ -1407,16 +1426,20 @@ def _compute_zone_detail(game, zone, tier="all", solo="any"):
             # source_name (who's conning/talking); death keys off
             # target_name (who died -- source_name for a death event is
             # the killer, e.g. "You", not the NPC roster we want here).
+            # "Test <level>" sparring dummies (see _is_test_dummy) are
+            # excluded -- artificial unlimited HP, not real zone content.
             cur.execute(
                 "WITH zone_npc_events AS ("
                 "  SELECT ev.source_name AS npc, ev.event_type, ev.amount, ev.extra "
                 "  FROM events ev JOIN games g ON ev.game_id=g.id "
                 "  WHERE ev.event_type IN ('con','npc_dialogue') AND ev.source_name IS NOT NULL "
+                "    AND ev.source_name NOT LIKE 'Test %%' "
                 f"    AND g.code=%s AND {match_where} "
                 "  UNION ALL "
                 "  SELECT ev.target_name AS npc, ev.event_type, ev.amount, ev.extra "
                 "  FROM events ev JOIN games g ON ev.game_id=g.id "
                 "  WHERE ev.event_type='death' AND ev.target_type != 'you' AND ev.target_name IS NOT NULL "
+                "    AND ev.target_name NOT LIKE 'Test %%' "
                 f"    AND g.code=%s AND {match_where}"
                 ") "
                 "SELECT npc, "
@@ -1617,18 +1640,21 @@ def _suggest_npc_type(name, rare_or_vendor_stats):
 
 
 def _compute_npc_list(game, search="", zone=""):
+    # "Test <level>" sparring dummies (see _is_test_dummy) are excluded --
+    # artificial unlimited HP, not real content worth searching/browsing.
     sql = (
         "WITH npc_events AS ("
         "  SELECT ev.source_name AS npc, ev.event_type, ev.amount, ev.extra, "
         f"    {_base_zone_expr()} AS zone "
         "  FROM events ev JOIN games g ON ev.game_id=g.id "
         "  WHERE g.code=%s AND ev.event_type IN ('con','npc_dialogue','vendor_buy','vendor_sell','loot') "
-        "    AND ev.source_name IS NOT NULL "
+        "    AND ev.source_name IS NOT NULL AND ev.source_name NOT LIKE 'Test %%' "
         "  UNION ALL "
         "  SELECT ev.target_name AS npc, ev.event_type, ev.amount, ev.extra, "
         f"    {_base_zone_expr()} AS zone "
         "  FROM events ev JOIN games g ON ev.game_id=g.id "
-        "  WHERE g.code=%s AND ev.event_type='death' AND ev.target_name IS NOT NULL AND ev.target_type != 'you'"
+        "  WHERE g.code=%s AND ev.event_type='death' AND ev.target_name IS NOT NULL AND ev.target_type != 'you' "
+        "    AND ev.target_name NOT LIKE 'Test %%'"
         ") "
         "SELECT npc, "
         "  MIN(CASE WHEN event_type='con' THEN amount END) AS level_min, "
@@ -2010,16 +2036,19 @@ EQL_OUT_OF_COMBAT_SECONDS = 5
 
 def _derive_gap_based_encounters(rows, gap_seconds):
     """rows: chronological (character_id, character_name, game, ts,
-    is_hard_stop, is_hard_start) rows -- regular activity (both flags False)
-    extends the encounter and is closed after gap_seconds of no further
-    activity; a hard-stop row (your death, Escape, zone change, or an
+    is_hard_stop, is_hard_start, marker_name) rows -- regular activity (both
+    flags False) extends the encounter and is closed after gap_seconds of no
+    further activity; a hard-stop row (your death, Escape, zone change, or an
     "Encounter Stop" /say marker) closes it immediately at its own
     timestamp, without itself starting a new encounter. A hard-start row
     (an "Encounter Start" /say marker) closes whatever's currently open
     (if anything) the same way a hard-stop does, but then immediately opens
     a new encounter starting at its own ts regardless of the gap timer --
     lets dummy/gear-testing pulls of the same mob with no death involved
-    still split into separate encounters instead of merging into one."""
+    still split into separate encounters instead of merging into one.
+    marker_name (only ever set on a hard-start row, e.g. "daggers" from
+    "Encounter Start daggers") is carried onto the new encounter as its
+    "name", for telling several such runs apart in the results table."""
     open_encounters: dict[int, dict] = {}
     finished = []
 
@@ -2052,6 +2081,7 @@ def _derive_gap_based_encounters(rows, gap_seconds):
             current = {
                 "character_id": cid, "character_name": row["character_name"],
                 "game": row["game"], "start_ts": row["ts"], "last_ts": row["ts"], "stop_ts": None,
+                "name": row["marker_name"] if row["is_hard_start"] else None,
             }
             open_encounters[cid] = current
         else:
@@ -2086,7 +2116,7 @@ def _compute_encounters(character="", start_ts="", end_ts="", npc="", limit=30, 
             # (an NPC's death doesn't end your combat -- there may be adds).
             cur.execute(
                 "SELECT ev.character_id, c.name AS character_name, g.code AS game, ev.ts, "
-                "  0 AS is_hard_stop, 0 AS is_hard_start "
+                "  0 AS is_hard_stop, 0 AS is_hard_start, NULL AS marker_name "
                 "FROM events ev JOIN characters c ON ev.character_id=c.id JOIN games g ON g.id=c.game_id "
                 "WHERE ("
                 f"  (ev.event_type IN {DAMAGE_EVENT_TYPES_SQL} AND (ev.source_type='you' OR ev.target_type='you'))"
@@ -2097,7 +2127,7 @@ def _compute_encounters(character="", start_ts="", end_ts="", npc="", limit=30, 
                 # the timer -- your own death, Escape, a zone change, or an
                 # "Encounter Stop" /say marker (see h_encounter_marker).
                 "SELECT ev.character_id, c.name AS character_name, g.code AS game, ev.ts, "
-                "  1 AS is_hard_stop, 0 AS is_hard_start "
+                "  1 AS is_hard_stop, 0 AS is_hard_start, NULL AS marker_name "
                 "FROM events ev JOIN characters c ON ev.character_id=c.id JOIN games g ON g.id=c.game_id "
                 "WHERE ("
                 "  (ev.event_type='death' AND ev.target_type='you')"
@@ -2106,12 +2136,13 @@ def _compute_encounters(character="", start_ts="", end_ts="", npc="", limit=30, 
                 "  OR (ev.event_type='encounter_marker' AND ev.verb='stop' AND ev.source_type='you')"
                 f") {where} "
                 "UNION ALL "
-                # Hard start: an "Encounter Start" /say marker -- closes
+                # Hard start: an "Encounter Start[ name]" /say marker -- closes
                 # whatever's open (same as a hard stop, above) but then
-                # immediately opens a fresh encounter at its own ts. See
+                # immediately opens a fresh encounter at its own ts, carrying
+                # the marker's optional name onto it. See
                 # _derive_gap_based_encounters for the actual behavior.
                 "SELECT ev.character_id, c.name AS character_name, g.code AS game, ev.ts, "
-                "  0 AS is_hard_stop, 1 AS is_hard_start "
+                "  0 AS is_hard_stop, 1 AS is_hard_start, ev.target_name AS marker_name "
                 "FROM events ev JOIN characters c ON ev.character_id=c.id JOIN games g ON g.id=c.game_id "
                 "WHERE (ev.event_type='encounter_marker' AND ev.verb='start' AND ev.source_type='you') "
                 f"{where} "
@@ -2246,6 +2277,7 @@ def _compute_encounters(character="", start_ts="", end_ts="", npc="", limit=30, 
             result.append({
                 "character": enc["character_name"],
                 "game": enc["game"],
+                "name": enc.get("name"),
                 "start_ts": enc["start_ts"].isoformat(),
                 "stop_ts": end.isoformat() if end else None,
                 "active": active,

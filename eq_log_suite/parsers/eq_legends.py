@@ -441,11 +441,14 @@ def h_encounter_marker(m):
     # _derive_gap_based_encounters in web/app.py: 'stop' behaves exactly
     # like an existing hard-stop (death/escape/zone-change); 'start' closes
     # whatever's currently open (if anything) and immediately opens a new
-    # encounter at its own ts, regardless of the gap timer.
+    # encounter at its own ts, regardless of the gap timer. name is an
+    # optional single-word label ("Encounter Start daggers") for telling
+    # several dummy/gear-testing runs apart at a glance on /encounters --
+    # stored in target_name, same field h_hail uses for its NPC name.
     return ParsedEvent(
         ts=None, raw_line=None, event_type="encounter_marker",
         source_name="You", source_type="you",
-        target_name=None, target_type=None,
+        target_name=m.group("name"), target_type=None,
         verb=m.group("verb").lower(), amount=None, outcome=None,
     )
 
@@ -811,15 +814,18 @@ class EQLegendsParser(GameParser):
         # Must come before the generic h_say pattern below.
         (re.compile(r"^You say, 'Hail(?:, (?P<npc>.+?))?'$"), h_hail),
 
-        # "You say, 'Encounter Start'" / "You say, 'Encounter Stop'" -- a
+        # "You say, 'Encounter Start'" / "You say, 'Encounter Stop'", plus an
+        # optional single-word name ("Encounter Start daggers") -- a
         # user-issued /say macro to hedge an explicit encounter boundary
         # (confirmed real, 2026-08-24: "[Mon Aug 24 12:19:11 2026] You say,
         # 'Encounter Start'" / "...12:19:15... 'Encounter Stop'"), for dummy/
         # gear-testing where /encounters' usual gap-timeout + death/escape/
         # zone-change boundaries don't help -- same mob name repeated with no
-        # death involved would otherwise all merge into one encounter. Must
-        # come before the generic h_say pattern below.
-        (re.compile(r"^You say, 'Encounter (?P<verb>Start|Stop)'$"), h_encounter_marker),
+        # death involved would otherwise all merge into one encounter. The
+        # name is one bare word (like a macro's %1), not free text, so it
+        # can't accidentally swallow a trailing sentence. Must come before
+        # the generic h_say pattern below.
+        (re.compile(r"^You say, 'Encounter (?P<verb>Start|Stop)(?: (?P<name>\S+))?'$"), h_encounter_marker),
 
         # "You say, 'exiled'" -- anything else said locally, e.g. echoing a
         # quest dialogue's bracketed keyword back to an NPC.
