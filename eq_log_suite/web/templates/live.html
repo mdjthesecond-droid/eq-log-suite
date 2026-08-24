@@ -289,6 +289,13 @@ imported log -- see <a href="/encounters">Encounters</a>.</p>
         e.event_type === "escape" ||
         (e.event_type === "zone_change" && e.source_type === "you");
       if (isHardStop && enc.active) stopEncounter(Date.now());
+      // "Encounter Start"/"Encounter Stop" /say markers -- same hard-start/
+      // hard-stop behavior as the server-side is_hard_start rows (see
+      // _derive_gap_based_encounters), for dummy/gear-testing.
+      if (e.event_type === "encounter_marker" && e.source_type === "you") {
+        if (e.verb === "start") startEncounter(Date.now());
+        else if (e.verb === "stop" && enc.active) stopEncounter(Date.now());
+      }
       recordEvent(e);
     }
     // EQL soft stop: no combat action in EQL_OUT_OF_COMBAT_SECONDS closes

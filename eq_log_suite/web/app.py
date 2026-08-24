@@ -2010,11 +2010,16 @@ EQL_OUT_OF_COMBAT_SECONDS = 5
 
 def _derive_gap_based_encounters(rows, gap_seconds):
     """rows: chronological (character_id, character_name, game, ts,
-    is_hard_stop) rows -- regular combat activity (is_hard_stop=False)
+    is_hard_stop, is_hard_start) rows -- regular activity (both flags False)
     extends the encounter and is closed after gap_seconds of no further
-    activity; a hard-stop row (your death, Escape, zone change) closes it
-    immediately at its own timestamp instead, without itself starting a new
-    encounter."""
+    activity; a hard-stop row (your death, Escape, zone change, or an
+    "Encounter Stop" /say marker) closes it immediately at its own
+    timestamp, without itself starting a new encounter. A hard-start row
+    (an "Encounter Start" /say marker) closes whatever's currently open
+    (if anything) the same way a hard-stop does, but then immediately opens
+    a new encounter starting at its own ts regardless of the gap timer --
+    lets dummy/gear-testing pulls of the same mob with no death involved
+    still split into separate encounters instead of merging into one."""
     open_encounters: dict[int, dict] = {}
     finished = []
 
@@ -2032,12 +2037,16 @@ def _derive_gap_based_encounters(rows, gap_seconds):
             current = None
             open_encounters[cid] = None
 
-        if row["is_hard_stop"]:
+        if row["is_hard_stop"] or row["is_hard_start"]:
             if current is not None:
                 current["stop_ts"] = row["ts"]
                 finished.append(current)
                 open_encounters[cid] = None
-            continue
+                current = None
+            if not row["is_hard_start"]:
+                continue
+            # fall through: a hard-start immediately opens a fresh encounter
+            # at this same row's ts, unlike a plain hard-stop.
 
         if current is None:
             current = {
@@ -2076,7 +2085,8 @@ def _compute_encounters(character="", start_ts="", end_ts="", npc="", limit=30, 
             # gap_seconds timeout. Damage either direction, or a kill BY you
             # (an NPC's death doesn't end your combat -- there may be adds).
             cur.execute(
-                "SELECT ev.character_id, c.name AS character_name, g.code AS game, ev.ts, 0 AS is_hard_stop "
+                "SELECT ev.character_id, c.name AS character_name, g.code AS game, ev.ts, "
+                "  0 AS is_hard_stop, 0 AS is_hard_start "
                 "FROM events ev JOIN characters c ON ev.character_id=c.id JOIN games g ON g.id=c.game_id "
                 "WHERE ("
                 f"  (ev.event_type IN {DAMAGE_EVENT_TYPES_SQL} AND (ev.source_type='you' OR ev.target_type='you'))"
@@ -2084,16 +2094,29 @@ def _compute_encounters(character="", start_ts="", end_ts="", npc="", limit=30, 
                 f") {where} "
                 "UNION ALL "
                 # Hard stops: close the encounter immediately regardless of
-                # the timer -- your own death, Escape, or a zone change.
-                "SELECT ev.character_id, c.name AS character_name, g.code AS game, ev.ts, 1 AS is_hard_stop "
+                # the timer -- your own death, Escape, a zone change, or an
+                # "Encounter Stop" /say marker (see h_encounter_marker).
+                "SELECT ev.character_id, c.name AS character_name, g.code AS game, ev.ts, "
+                "  1 AS is_hard_stop, 0 AS is_hard_start "
                 "FROM events ev JOIN characters c ON ev.character_id=c.id JOIN games g ON g.id=c.game_id "
                 "WHERE ("
                 "  (ev.event_type='death' AND ev.target_type='you')"
                 "  OR ev.event_type='escape'"
                 "  OR (ev.event_type='zone_change' AND ev.source_type='you')"
+                "  OR (ev.event_type='encounter_marker' AND ev.verb='stop' AND ev.source_type='you')"
                 f") {where} "
+                "UNION ALL "
+                # Hard start: an "Encounter Start" /say marker -- closes
+                # whatever's open (same as a hard stop, above) but then
+                # immediately opens a fresh encounter at its own ts. See
+                # _derive_gap_based_encounters for the actual behavior.
+                "SELECT ev.character_id, c.name AS character_name, g.code AS game, ev.ts, "
+                "  0 AS is_hard_stop, 1 AS is_hard_start "
+                "FROM events ev JOIN characters c ON ev.character_id=c.id JOIN games g ON g.id=c.game_id "
+                "WHERE (ev.event_type='encounter_marker' AND ev.verb='start' AND ev.source_type='you') "
+                f"{where} "
                 "ORDER BY ts",
-                params + params,
+                params + params + params,
             )
             activity = cur.fetchall()
 

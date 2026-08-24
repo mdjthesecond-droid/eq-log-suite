@@ -435,6 +435,21 @@ def h_hail(m):
     )
 
 
+def h_encounter_marker(m):
+    # verb is 'start' or 'stop' (lowercased for consistency with other verb
+    # values elsewhere, e.g. combat outcomes). Consumed by
+    # _derive_gap_based_encounters in web/app.py: 'stop' behaves exactly
+    # like an existing hard-stop (death/escape/zone-change); 'start' closes
+    # whatever's currently open (if anything) and immediately opens a new
+    # encounter at its own ts, regardless of the gap timer.
+    return ParsedEvent(
+        ts=None, raw_line=None, event_type="encounter_marker",
+        source_name="You", source_type="you",
+        target_name=None, target_type=None,
+        verb=m.group("verb").lower(), amount=None, outcome=None,
+    )
+
+
 def h_say(m):
     # Catch-all for "You say, '...'" that isn't a hail -- this is how a
     # quest dialogue keyword gets echoed back to an NPC (e.g. "You say,
@@ -795,6 +810,16 @@ class EQLegendsParser(GameParser):
         # "You say, 'Hail, Translocator Fithop'" / bare "You say, 'Hail'".
         # Must come before the generic h_say pattern below.
         (re.compile(r"^You say, 'Hail(?:, (?P<npc>.+?))?'$"), h_hail),
+
+        # "You say, 'Encounter Start'" / "You say, 'Encounter Stop'" -- a
+        # user-issued /say macro to hedge an explicit encounter boundary
+        # (confirmed real, 2026-08-24: "[Mon Aug 24 12:19:11 2026] You say,
+        # 'Encounter Start'" / "...12:19:15... 'Encounter Stop'"), for dummy/
+        # gear-testing where /encounters' usual gap-timeout + death/escape/
+        # zone-change boundaries don't help -- same mob name repeated with no
+        # death involved would otherwise all merge into one encounter. Must
+        # come before the generic h_say pattern below.
+        (re.compile(r"^You say, 'Encounter (?P<verb>Start|Stop)'$"), h_encounter_marker),
 
         # "You say, 'exiled'" -- anything else said locally, e.g. echoing a
         # quest dialogue's bracketed keyword back to an NPC.
