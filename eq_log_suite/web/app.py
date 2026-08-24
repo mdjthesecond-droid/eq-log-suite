@@ -2682,15 +2682,31 @@ def _compute_encounter_healing_breakdown(windows, label_self_as_you=True):
 
 def _compute_encounter_procs(windows):
     """Proc-trigger counts (event_type='proc_trigger', see h_proc_trigger in
-    eq_legends.py) and rune_gain totals (event_type='rune_gain', see
-    h_rune_gain), across one or more windows -- same window-OR'ing
-    convention as _compute_encounter_combat_breakdown. Self-only events (no
-    target/npc), so no per-mob split -- just a flat count per proc name and
-    a rune_gain summary. Lets a named "Encounter Start daggers"-style run
-    (see [[project_encounter_markers]]) be compared against another gear
-    loadout for proc rate and rune size, not just damage."""
+    eq_legends.py) and rune instances (rune_buff_start...rune_buff_end, with
+    rune_gain top-ups accumulated in between -- see h_rune_buff_start/
+    h_rune_gain/h_rune_buff_end), across one or more windows -- same
+    window-OR'ing convention as _compute_encounter_combat_breakdown.
+    Self-only events (no target/npc), so no per-mob split. Lets a named
+    "Encounter Start daggers"-style run (see [[project_encounter_markers]])
+    be compared against another gear loadout for proc rate and rune
+    size/uptime, not just damage.
+
+    Confirmed real (2026-08-24): "gain a rune for N points" fires far more
+    often than the buff icon actually (re)applying or breaking -- most
+    ticks just top up an already-active rune rather than starting a new
+    one, and a rune can persist across the gap between two encounters
+    (confirmed real: 7 top-ups landed in a window whose own rune_buff_start
+    was several minutes earlier, in the previous pull). So each window is
+    seeded with whatever rune was already open as of its own start_ts
+    (looked up separately below) before pairing the in-window
+    start/gain/end events sequentially per character. A gain with no rune
+    open even after seeding (confirmed real: a burst of ticks with no
+    rune_buff_start nearby at all -- turned out to be a Focus-effect item
+    "shimmers briefly" pulse, not a rune source, so deliberately not
+    attributed to it) lands in an "Unknown source" bucket instead of being
+    dropped -- see the rune_gain branch below."""
     if not windows:
-        return {"procs": [], "rune_gains": None}
+        return {"procs": [], "rune_instances": []}
 
     clauses, params = [], []
     for w in windows:
@@ -2717,23 +2733,97 @@ def _compute_encounter_procs(windows):
             procs = cur.fetchall()
 
             cur.execute(
-                "SELECT COUNT(*) AS gains, SUM(ev.amount) AS total, "
-                "MIN(ev.amount) AS min_amt, MAX(ev.amount) AS max_amt "
+                "SELECT ev.character_id, ev.ts, ev.event_type, ev.target_name AS tier, ev.amount "
                 "FROM events ev JOIN characters c ON ev.character_id=c.id "
-                f"WHERE ({where}) AND ev.event_type='rune_gain'",
+                f"WHERE ({where}) "
+                "AND ev.event_type IN ('rune_buff_start','rune_gain','rune_buff_end') "
+                "ORDER BY ev.character_id, ev.ts",
                 params,
             )
-            rune_row = cur.fetchone()
+            rune_events = cur.fetchall()
+
+            # A rune can already be active when a window starts (confirmed
+            # real: it can persist across the gap between two encounters,
+            # getting silently topped up the whole time) -- its own
+            # rune_buff_start then falls before this window and would
+            # otherwise never be seen, leaving every in-window top-up
+            # orphaned with no instance to attribute to. Seed each window's
+            # character with whatever rune_buff_start most recently
+            # preceded it, unless a rune_buff_end already closed it first.
+            seed_by_char: dict[int, dict] = {}
+            for w in windows:
+                cur.execute(
+                    "SELECT ev.character_id, ev.ts, ev.event_type, ev.target_name AS tier "
+                    "FROM events ev JOIN characters c ON ev.character_id=c.id "
+                    "WHERE c.name=%s AND ev.ts <= %s "
+                    "AND ev.event_type IN ('rune_buff_start','rune_buff_end') "
+                    "ORDER BY ev.ts DESC LIMIT 1",
+                    (w["character"], w["start_ts"]),
+                )
+                row = cur.fetchone()
+                if row and row["event_type"] == "rune_buff_start":
+                    seed_by_char[row["character_id"]] = {
+                        "tier": row["tier"], "start_ts": row["ts"], "end_ts": None,
+                        "gain_count": 0, "total": 0,
+                    }
     finally:
         conn.close()
 
-    rune_gains = None
-    if rune_row and rune_row["gains"]:
-        rune_gains = {
-            "count": rune_row["gains"], "total": rune_row["total"],
-            "min": rune_row["min_amt"], "max": rune_row["max_amt"],
-        }
-    return {"procs": procs, "rune_gains": rune_gains}
+    # Confirmed real (2026-08-24): at 1s log resolution, "You gain a rune
+    # for N points" and "A coat of shimmering runes surrounds you." can
+    # share the exact same timestamp with the gain line printed FIRST in
+    # the raw log -- SQL's ORDER BY ts alone doesn't guarantee a stable tie-
+    # break, and the physical log order would otherwise have the gain
+    # arrive with no instance open yet to attribute it to. Re-sorted here
+    # so same-tick events always resolve start-before-gain-before-end,
+    # regardless of raw row order.
+    _RUNE_EVENT_PRIORITY = {"rune_buff_start": 0, "rune_gain": 1, "rune_buff_end": 2}
+    rune_events = sorted(
+        rune_events,
+        key=lambda e: (e["character_id"], e["ts"], _RUNE_EVENT_PRIORITY[e["event_type"]]),
+    )
+
+    rune_instances = []
+    open_by_char: dict[int, dict] = seed_by_char
+    for ev in rune_events:
+        cid = ev["character_id"]
+        if ev["event_type"] == "rune_buff_start":
+            if cid in open_by_char:  # defensive: two starts with no fade between them
+                rune_instances.append(open_by_char.pop(cid))
+            open_by_char[cid] = {
+                "tier": ev["tier"], "start_ts": ev["ts"], "end_ts": None,
+                "gain_count": 0, "total": 0,
+            }
+        elif ev["event_type"] == "rune_gain":
+            inst = open_by_char.get(cid)
+            if inst is None:
+                # No known rune-tier instance open, even after seeding --
+                # confirmed real (2026-08-24): a burst of "gain a rune"
+                # ticks with no rune_buff_start anywhere nearby, preceded
+                # instead by "<Item> (Exaltation) shimmers briefly." (a
+                # Focus effect pulsing, e.g. "Djarn's Amethyst Ring") --
+                # deliberately NOT attributed to that item, since a Focus
+                # effect firing isn't the same thing as it being the rune's
+                # actual source (unconfirmed link, same reasoning as not
+                # linking rune_gain to Rampage). Bucketed here instead of
+                # dropped, so the real point total isn't silently lost.
+                inst = open_by_char.setdefault(cid, {
+                    "tier": "Unknown source", "start_ts": ev["ts"], "end_ts": None,
+                    "gain_count": 0, "total": 0,
+                })
+            inst["gain_count"] += 1
+            inst["total"] += ev["amount"] or 0
+        elif ev["event_type"] == "rune_buff_end":
+            inst = open_by_char.pop(cid, None)
+            if inst is not None:
+                inst["end_ts"] = ev["ts"]
+                rune_instances.append(inst)
+    rune_instances.extend(open_by_char.values())  # still active at window end
+
+    for inst in rune_instances:
+        inst["duration_s"] = round((inst["end_ts"] - inst["start_ts"]).total_seconds()) if inst["end_ts"] else None
+    rune_instances.sort(key=lambda i: i["start_ts"])
+    return {"procs": procs, "rune_instances": rune_instances}
 
 
 def _build_encounter_healing(windows, label_self_as_you, duration_s):
@@ -2860,7 +2950,7 @@ def encounter_breakdown(request: Request, character: str, start_ts: str, stop_ts
         "damage_totals": None,
         "healers": healers,
         "procs": procs["procs"],
-        "rune_gains": procs["rune_gains"],
+        "rune_instances": procs["rune_instances"],
         "merged": False,
         "windows": None,
         "start_ts": start_ts,
@@ -2928,7 +3018,7 @@ def encounter_breakdown_merged(
         "damage_totals": damage_totals,
         "healers": healers,
         "procs": procs["procs"],
-        "rune_gains": procs["rune_gains"],
+        "rune_instances": procs["rune_instances"],
         "merged": True,
         "windows": windows,
         "start_ts": windows[0]["start_ts"],

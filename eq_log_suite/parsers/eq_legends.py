@@ -184,19 +184,61 @@ def h_absorb_incoming_other(m):
 
 def h_rune_gain(m):
     # "You gain a rune for 90 points of absorption." -- confirmed real
-    # 2026-08-24, amounts seen ranging 34-90 across different sessions
-    # (gear/level dependent). No proc name is stated in this line itself --
-    # confirmed real that it lands at the same timestamp as "You feel the
-    # urge to rampage." (see _PROC_TRIGGER_PHRASES) but nothing in the text
-    # itself ties the two together, so this is recorded as its own
-    # independent event rather than asserting a causal link only inferred
-    # from adjacency. Encounter Breakdown correlates them by simply being
-    # in the same window.
+    # 2026-08-24, amounts seen ranging 34-394 across different
+    # sessions/sources. This is a top-up tick, not a new buff -- confirmed
+    # real that it fires far more often (3458 times in one log) than the
+    # buff actually being (re)applied (129 times, see
+    # _RUNE_TIER_START_PHRASES) or breaking (128 times, see
+    # h_rune_buff_end), so most of these just add points to an already-
+    # active rune rather than starting a fresh one. No source/tier is
+    # stated in this line itself -- Encounter Breakdown buckets these into
+    # whichever rune-tier instance (start...end window, see
+    # _compute_encounter_procs) they fall inside instead.
     return ParsedEvent(
         ts=None, raw_line=None, event_type="rune_gain",
         source_name="You", source_type="you",
         target_name=None, target_type=None,
         verb=None, amount=_amount(m), outcome=None,
+    )
+
+
+# Rune-tier buff-icon apply messages -- distinct wording per tier (I-IV;
+# user confirmed the game stops at IV this version), letting the generic
+# "gain a rune for N points" top-up ticks above be bucketed by which tier
+# was actually active. Only Rune IV's phrase is confirmed against a real
+# log line so far (2026-08-24) -- I/II/III came from the user's own spell
+# data lookup, not yet seen occur; flag if the real text doesn't match
+# exactly once one of them actually fires. "X surrounds you." is also a
+# generic buff-apply template other unrelated spells use (confirmed real:
+# "A dull white aura surrounds you.", "A soft mist surrounds you.", etc.),
+# so these are matched by exact phrase, not that generic shape.
+_RUNE_TIER_START_PHRASES = {
+    "A light shimmer of runes surrounds you.": "Rune I",
+    "A shimmer of runes surrounds you.": "Rune II",
+    "A dark shimmer of runes surrounds you.": "Rune III",
+    "A coat of shimmering runes surrounds you.": "Rune IV",
+}
+
+
+def h_rune_buff_start(m):
+    return ParsedEvent(
+        ts=None, raw_line=None, event_type="rune_buff_start",
+        source_name="You", source_type="you",
+        target_name=_RUNE_TIER_START_PHRASES[m.group(0)], target_type=None,
+        verb=None, amount=None, outcome=None,
+    )
+
+
+def h_rune_buff_end(m):
+    # "The shimmer of runes fades." -- confirmed real the same single
+    # phrase covers every tier (user confirmed 2026-08-24), so unlike
+    # h_rune_buff_start this carries no tier name -- Encounter Breakdown
+    # already knows which tier was open when pairing this with its start.
+    return ParsedEvent(
+        ts=None, raw_line=None, event_type="rune_buff_end",
+        source_name="You", source_type="you",
+        target_name=None, target_type=None,
+        verb=None, amount=None, outcome=None,
     )
 
 
@@ -804,6 +846,12 @@ class EQLegendsParser(GameParser):
 
         # "You gain a rune for 90 points of absorption."
         (re.compile(r"^You gain a rune for (?P<amount>\d+) points? of absorption\.$"), h_rune_gain),
+
+        # Rune-tier buff apply -- see _RUNE_TIER_START_PHRASES.
+        (re.compile("^(?:" + "|".join(re.escape(p) for p in _RUNE_TIER_START_PHRASES) + ")$"), h_rune_buff_start),
+
+        # Rune-tier buff fade -- same phrase for every tier.
+        (re.compile(r"^The shimmer of runes fades\.$"), h_rune_buff_end),
 
         # Self-triggered proc messages -- see _PROC_TRIGGER_PHRASES above.
         (re.compile("^(?:" + "|".join(re.escape(p) for p in _PROC_TRIGGER_PHRASES) + ")$"), h_proc_trigger),

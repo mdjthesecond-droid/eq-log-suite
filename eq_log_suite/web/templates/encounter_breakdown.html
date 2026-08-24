@@ -206,7 +206,7 @@
 {% endif %}
 
 <h2>Procs</h2>
-{% if not procs and not rune_gains %}
+{% if not procs and not rune_instances %}
 <p style="opacity:0.8;">No proc triggers in this window.</p>
 {% else %}
 <table style="margin-bottom:1rem;">
@@ -215,11 +215,11 @@
       <td>{{ p.triggers }} trigger(s)</td>
       <td style="opacity:0.7;">-- {{ (p.triggers / (duration_s / 60))|round(2) if duration_s else 0 }}/min</td></tr>
   {% endfor %}
-  {% if rune_gains %}
-  <tr><td style="opacity:0.7; padding-right:1rem;">Rune (absorption)</td>
-      <td>{{ rune_gains.count }} gained, {{ rune_gains.total }} total points</td>
-      <td style="opacity:0.7;">-- {{ rune_gains.min }}{% if rune_gains.min != rune_gains.max %}-{{ rune_gains.max }}{% endif %} each</td></tr>
-  {% endif %}
+  {% for r in rune_instances %}
+  <tr><td style="opacity:0.7; padding-right:1rem;">{{ r.tier }}</td>
+      <td>{{ r.total }} points absorption{% if r.gain_count > 1 %} ({{ r.gain_count }} top-ups){% endif %}</td>
+      <td style="opacity:0.7;">-- {% if r.duration_s is not none %}{{ r.duration_s }}s uptime{% else %}still active{% endif %}</td></tr>
+  {% endfor %}
 </table>
 {% endif %}
 
