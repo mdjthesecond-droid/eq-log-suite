@@ -19,6 +19,65 @@ monitoring while you're actually playing, see <a href="/live">Live</a> instead.<
   <li><a href="/eq">EverQuest</a></li>
 </ul>
 
+<h2>Log rotation</h2>
+<p>Per-game policy for the automatic log rotation the tailer performs to keep an actively-tailed
+log file from growing without bound. "Rotate now" archives the file immediately and works
+regardless of the mode selected below.</p>
+{% for g in games %}
+{% set r = rotation[g.id] %}
+<h3>{{ g.name }}</h3>
+<form class="rotation-form" method="post" action="/rotation/settings">
+  <input type="hidden" name="game_id" value="{{ g.id }}">
+  <label>Mode
+    <select name="mode" onchange="updateRotationFields(this)">
+      <option value="manual" {{ 'selected' if r.mode == 'manual' }}>Manual only</option>
+      <option value="day_of_week" {{ 'selected' if r.mode == 'day_of_week' }}>Day of week</option>
+      <option value="day_of_month" {{ 'selected' if r.mode == 'day_of_month' }}>Day of month</option>
+      <option value="size" {{ 'selected' if r.mode == 'size' }}>File size</option>
+    </select>
+  </label>
+  <label data-modes="day_of_week">Weekday
+    <select name="day_of_week">
+      {% for i, wd_name in [(0,'Monday'),(1,'Tuesday'),(2,'Wednesday'),(3,'Thursday'),(4,'Friday'),(5,'Saturday'),(6,'Sunday')] %}
+      <option value="{{ i }}" {{ 'selected' if r.day_of_week == i }}>{{ wd_name }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label data-modes="day_of_month">Day of month
+    <input type="number" name="day_of_month" min="1" max="31" value="{{ r.day_of_month or 1 }}">
+  </label>
+  <label data-modes="day_of_week,day_of_month">Hour (Eastern)
+    <input type="number" name="hour" min="0" max="23" value="{{ r.hour }}">
+  </label>
+  <label data-modes="size">Size threshold
+    <input type="number" step="0.1" name="size_value" value="{{ (r.size_bytes / 1048576)|round(1) if r.size_bytes else '' }}">
+    <select name="size_unit">
+      <option value="MB">MB</option>
+      <option value="GB">GB</option>
+    </select>
+  </label>
+  <button type="submit">Save</button>
+</form>
+<form method="post" action="/rotation/trigger" style="display:inline">
+  <input type="hidden" name="game_id" value="{{ g.id }}">
+  <button type="submit">Rotate now</button>
+</form>
+{% if r.manual_trigger_at %}<p><small>Last manual trigger: {{ r.manual_trigger_at }} UTC</small></p>{% endif %}
+{% endfor %}
+<script>
+function updateRotationFields(select) {
+  var form = select.closest('form');
+  var mode = select.value;
+  form.querySelectorAll('[data-modes]').forEach(function(el) {
+    var modes = el.dataset.modes.split(',');
+    el.hidden = modes.indexOf(mode) === -1;
+  });
+}
+document.querySelectorAll('.rotation-form select[name=mode]').forEach(function(select) {
+  updateRotationFields(select);
+});
+</script>
+
 <h2>While playing</h2>
 <ul>
   <li><a href="/live">Live</a> -- current zone, active encounter DPS/hit%/crit%, and the last 40 encounters, updating as the tailer parses new lines.</li>

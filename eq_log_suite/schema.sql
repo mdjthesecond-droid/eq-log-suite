@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS log_sources (
     file_path VARCHAR(1024) NOT NULL,
     last_byte_offset BIGINT NOT NULL DEFAULT 0,
     last_parsed_at DATETIME NULL,
+    last_rotated_at DATETIME NULL,  -- UTC; see tailer.py's weekly rotation
     live BOOLEAN NOT NULL DEFAULT FALSE,
     FOREIGN KEY (game_id) REFERENCES games(id),
     FOREIGN KEY (character_id) REFERENCES characters(id),
@@ -122,6 +123,23 @@ CREATE TABLE IF NOT EXISTS zone_info (
     level_max_override INT NULL,
     note VARCHAR(255) NULL,
     confirmed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB;
+
+-- Per-game weekly log rotation policy (one row per game) -- see tailer.py's
+-- tail_log_source for how this is consumed. mode='manual' means no
+-- automatic schedule; day_of_week/day_of_month/hour are all local to
+-- ROTATION_TZ (tailer.py); size_bytes only applies to mode='size'.
+-- manual_trigger_at is independent of mode -- set by the "Rotate now" button
+-- on the home page, honored regardless of which automatic mode is active.
+CREATE TABLE IF NOT EXISTS rotation_settings (
+    game_id INT NOT NULL PRIMARY KEY,
+    mode ENUM('manual', 'day_of_week', 'day_of_month', 'size') NOT NULL DEFAULT 'manual',
+    day_of_week TINYINT NULL,        -- 0=Monday .. 6=Sunday
+    day_of_month TINYINT NULL,       -- 1-31 (capped to the last real day of short months)
+    hour TINYINT NOT NULL DEFAULT 9, -- local hour in ROTATION_TZ, for day_of_week/day_of_month
+    size_bytes BIGINT NULL,
+    manual_trigger_at DATETIME NULL, -- UTC
+    FOREIGN KEY (game_id) REFERENCES games(id)
 ) ENGINE=InnoDB;
 
 -- Zone correlation (used by /loot, /quests) works by finding the

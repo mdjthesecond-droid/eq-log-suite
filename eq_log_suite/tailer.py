@@ -14,11 +14,14 @@ Add a file to live-tail with:
 
 import argparse
 import asyncio
+import calendar
 import json
 import os
 import signal
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from eq_log_suite import db, discovery, ingest
 from eq_log_suite.alerts import AlertEngine
@@ -31,6 +34,95 @@ DISCOVERY_INTERVAL_SECONDS = 300  # re-scan for new/rotated log files every 5 mi
 # discovery loop immediately instead of waiting for the next timer tick --
 # see eq_log_suite.web.app's /import/rescan route.
 PID_PATH = Path(__file__).resolve().parent.parent / "logs" / "tailer.pid"
+
+# Log rotation, to keep an actively-tailed eqlog file from growing unbounded
+# over a long-running character. EQ doesn't hold the log file open for the
+# whole session -- it notices the path disappear and starts writing a fresh
+# file there (or picks up an existing empty one immediately) on its own, so
+# renaming the file aside and recreating an empty one at the original path
+# is safe to do live, not just while EQ is closed. Policy (whether to
+# auto-rotate at all, and how) is per-game -- see db.get_rotation_settings --
+# and configurable from the home page; mode='manual' (the default for a game
+# that's never been configured) means no automatic schedule at all, only the
+# "Rotate now" button (which sets manual_trigger_at, honored regardless of
+# mode).
+#
+# Rather than scheduling a single "next rotation" moment (which would miss
+# entirely if the tailer wasn't running at that exact instant), each
+# log_source persists last_rotated_at (see db.mark_log_source_rotated) and
+# every loop tick asks "has a rotation boundary passed since we last
+# rotated?" via _most_recent_weekday_boundary/_most_recent_month_day_boundary.
+# That covers all of: rotating right on time while running through the
+# boundary, rotating on schedule even while idle (no new lines, loop still
+# ticks), and catching up immediately on startup if the tailer was off when
+# the boundary passed -- whether that was five minutes ago or two weeks ago
+# (e.g. back from vacation) -- instead of waiting for the next one.
+ROTATION_TZ = ZoneInfo("America/New_York")
+ROTATION_SETTINGS_REFRESH_SECONDS = 15  # how often each tail task re-reads its game's policy
+
+
+def _most_recent_weekday_boundary(before: datetime, weekday: int, hour: int) -> datetime:
+    """The most recent `weekday` (0=Monday..6=Sunday) at `hour`:00 in
+    ROTATION_TZ that is <= `before` (which must be tz-aware)."""
+    local = before.astimezone(ROTATION_TZ)
+    candidate = local.replace(hour=hour, minute=0, second=0, microsecond=0)
+    days_back = (candidate.weekday() - weekday) % 7
+    candidate -= timedelta(days=days_back)
+    if candidate > local:
+        candidate -= timedelta(weeks=1)
+    return candidate
+
+
+def _most_recent_month_day_boundary(before: datetime, day_of_month: int, hour: int) -> datetime:
+    """The most recent `day_of_month` (1-31, capped to the last real day of
+    a short month -- e.g. 31 means "last day" in a 30-day month) at
+    `hour`:00 in ROTATION_TZ that is <= `before`."""
+    local = before.astimezone(ROTATION_TZ)
+
+    def boundary_for(year: int, month: int) -> datetime:
+        day = min(day_of_month, calendar.monthrange(year, month)[1])
+        return datetime(year, month, day, hour, 0, 0, tzinfo=ROTATION_TZ)
+
+    candidate = boundary_for(local.year, local.month)
+    if candidate > local:
+        year, month = (local.year, local.month - 1) if local.month > 1 else (local.year - 1, 12)
+        candidate = boundary_for(year, month)
+    return candidate
+
+
+def _rotation_due(settings: dict, wall_now: datetime, last_rotated_at: datetime | None, current_size: int) -> bool:
+    """True if `settings` (a rotation_settings row, or db.get_rotation_settings's
+    manual-only default) calls for a rotation right now. The manual trigger
+    (the home page's "Rotate now" button) always takes priority and applies
+    regardless of mode."""
+    manual_trigger_at = settings.get("manual_trigger_at")
+    if manual_trigger_at is not None:
+        trigger = manual_trigger_at.replace(tzinfo=timezone.utc)
+        if last_rotated_at is None or last_rotated_at < trigger:
+            return True
+
+    mode = settings.get("mode", "manual")
+    if mode == "day_of_week" and settings.get("day_of_week") is not None:
+        boundary = _most_recent_weekday_boundary(wall_now, settings["day_of_week"], settings["hour"])
+        return last_rotated_at is None or last_rotated_at < boundary
+    if mode == "day_of_month" and settings.get("day_of_month") is not None:
+        boundary = _most_recent_month_day_boundary(wall_now, settings["day_of_month"], settings["hour"])
+        return last_rotated_at is None or last_rotated_at < boundary
+    if mode == "size" and settings.get("size_bytes"):
+        return current_size >= settings["size_bytes"]
+    return False  # mode == "manual" (or an unconfigured mode field): no automatic schedule
+
+
+def _rotate_log_file(path: str) -> int:
+    """Renames the current log file aside with a timestamp suffix, then
+    immediately creates an empty file at the original path -- back to back,
+    no I/O in between, to keep the window where the path doesn't exist as
+    close to zero as possible. Returns the new byte offset (always 0)."""
+    archive_path = f"{path}.{datetime.now(ROTATION_TZ):%Y%m%d-%H%M%S}"
+    os.rename(path, archive_path)
+    open(path, "wb").close()
+    print(f"[tailer] rotated {path} -> {archive_path}")
+    return 0
 
 # DPS meter tuning: how it decides combat has ended (freeze, don't reset to
 # zero) vs. is still ongoing between hits, and how often it re-broadcasts a
@@ -215,14 +307,27 @@ async def tail_log_source(conn, log_source, broadcaster: OverlayBroadcaster):
     alert_engine = AlertEngine(conn, log_source["game_id"], broadcast=broadcaster.send)
     dps = DPSTracker(label=f"{character_name} ({game_code})")
     combat = CombatTracker(label=f"{character_name} ({game_code})")
+    # The lookups above are all bare SELECTs with autocommit off, so without
+    # this the transaction they opened just sits there -- holding a metadata
+    # lock on games/characters/alert_rules -- for as long as the game stays
+    # down and no log line comes in to trigger a commit elsewhere. Blocked a
+    # schema migration this way once already.
+    conn.commit()
 
     path = log_source["file_path"]
     log_source_id = log_source["id"]
     game_id = log_source["game_id"]
     character_id = log_source["character_id"]
     offset = log_source["last_byte_offset"]
+    last_rotated_at = log_source.get("last_rotated_at")
+    if last_rotated_at is not None:
+        last_rotated_at = last_rotated_at.replace(tzinfo=timezone.utc)
 
-    with open(path, "rb") as f:
+    rotation_settings = db.get_rotation_settings(conn, game_id)
+    rotation_settings_refreshed_at = time.monotonic()
+
+    f = open(path, "rb")
+    try:
         prefix = f.read(offset)
         line_no = prefix.count(b"\n")
         f.seek(offset)
@@ -230,6 +335,19 @@ async def tail_log_source(conn, log_source, broadcaster: OverlayBroadcaster):
         print(f"[tailer] watching {path} from byte {offset} (line {line_no})")
         while True:
             now = time.monotonic()
+            if now - rotation_settings_refreshed_at > ROTATION_SETTINGS_REFRESH_SECONDS:
+                rotation_settings = db.get_rotation_settings(conn, game_id)
+                rotation_settings_refreshed_at = now
+
+            wall_now = datetime.now(ROTATION_TZ)
+            current_size = os.fstat(f.fileno()).st_size if rotation_settings.get("mode") == "size" else 0
+            if _rotation_due(rotation_settings, wall_now, last_rotated_at, current_size):
+                f.close()
+                offset = _rotate_log_file(path)
+                f = open(path, "rb")
+                last_rotated_at = wall_now
+                db.mark_log_source_rotated(conn, log_source_id, offset)
+
             # DPS bookkeeping runs every iteration -- including idle ones --
             # so the timeout fires and the on-screen timer keeps ticking
             # even during gaps between hits, not just when a new line lands.
@@ -317,6 +435,8 @@ async def tail_log_source(conn, log_source, broadcaster: OverlayBroadcaster):
                                 "color": [0.9, 0.3, 0.2],
                                 "duration": COMBAT_ALERT_DURATION_SECONDS,
                             })
+    finally:
+        f.close()
 
 
 def _game_code_for(conn, game_id: int) -> str:
@@ -373,6 +493,12 @@ async def main_async(socket_path: str, eql_root: str | None, eq_root: str | None
     with conn.cursor() as cur:
         cur.execute("SELECT * FROM log_sources WHERE live=1")
         live_sources = cur.fetchall()
+    # This connection isn't reused for anything else -- each tail task below
+    # gets its own -- so end its transaction and hand it back to the pool
+    # rather than letting it sit open (and holding a metadata lock) for the
+    # rest of this forever-running coroutine's life.
+    conn.commit()
+    conn.close()
 
     if not live_sources:
         print(

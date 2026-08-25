@@ -98,7 +98,54 @@ def run_select(sql: str):
 
 @app.get("/", response_class=HTMLResponse)
 def home(request: Request):
-    return templates.TemplateResponse(request, "home.html", {})
+    conn = db.get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, code, name FROM games ORDER BY name")
+            games = cur.fetchall()
+        rotation = {g["id"]: db.get_rotation_settings(conn, g["id"]) for g in games}
+    finally:
+        conn.close()
+    return templates.TemplateResponse(request, "home.html", {"games": games, "rotation": rotation})
+
+
+@app.post("/rotation/settings")
+def rotation_settings_update(
+    game_id: int = Form(...),
+    mode: str = Form(...),
+    day_of_week: str = Form(""),
+    day_of_month: str = Form(""),
+    hour: int = Form(9),
+    size_value: str = Form(""),
+    size_unit: str = Form("MB"),
+):
+    size_bytes = None
+    if size_value:
+        multiplier = 1024 * 1024 * 1024 if size_unit == "GB" else 1024 * 1024
+        size_bytes = int(float(size_value) * multiplier)
+    conn = db.get_connection()
+    try:
+        db.upsert_rotation_settings(
+            conn, game_id, mode,
+            int(day_of_week) if day_of_week != "" else None,
+            int(day_of_month) if day_of_month != "" else None,
+            hour, size_bytes,
+        )
+    finally:
+        conn.close()
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/rotation/trigger")
+def rotation_trigger(game_id: int = Form(...)):
+    # Sets manual_trigger_at, which tail_log_source honors regardless of the
+    # game's configured mode -- see db.trigger_rotation_now.
+    conn = db.get_connection()
+    try:
+        db.trigger_rotation_now(conn, game_id)
+    finally:
+        conn.close()
+    return RedirectResponse("/", status_code=303)
 
 
 @app.get("/eql", response_class=HTMLResponse)

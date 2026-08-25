@@ -87,8 +87,12 @@ def get_or_create_log_source(conn, game_id: int, character_id: int, file_path: s
         if row:
             return row
         cur.execute(
-            "INSERT INTO log_sources (game_id, character_id, file_path, last_byte_offset, live) "
-            "VALUES (%s, %s, %s, 0, %s)",
+            # last_rotated_at starts at creation time, not NULL/epoch -- so a
+            # brand-new log file doesn't immediately get treated as
+            # "overdue" and rotated away seconds after it starts being
+            # tailed (see _most_recent_rotation_boundary in tailer.py).
+            "INSERT INTO log_sources (game_id, character_id, file_path, last_byte_offset, live, last_rotated_at) "
+            "VALUES (%s, %s, %s, 0, %s, UTC_TIMESTAMP())",
             (game_id, character_id, file_path, live),
         )
         conn.commit()
@@ -100,6 +104,68 @@ def update_log_source_offset(conn, log_source_id: int, offset: int):
     with conn.cursor() as cur:
         cur.execute(
             "UPDATE log_sources SET last_byte_offset=%s, last_parsed_at=NOW() WHERE id=%s",
+            (offset, log_source_id),
+        )
+    conn.commit()
+
+
+def get_rotation_settings(conn, game_id: int) -> dict:
+    """Returns this game's rotation policy, or a manual-only default if it's
+    never been configured -- a game the user hasn't touched shouldn't
+    silently start auto-rotating."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM rotation_settings WHERE game_id=%s", (game_id,))
+        row = cur.fetchone()
+    if row is not None:
+        return row
+    return {
+        "game_id": game_id, "mode": "manual", "day_of_week": None,
+        "day_of_month": None, "hour": 9, "size_bytes": None, "manual_trigger_at": None,
+    }
+
+
+def upsert_rotation_settings(
+    conn, game_id: int, mode: str, day_of_week: int | None, day_of_month: int | None,
+    hour: int, size_bytes: int | None,
+):
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO rotation_settings (game_id, mode, day_of_week, day_of_month, hour, size_bytes) "
+            "VALUES (%s,%s,%s,%s,%s,%s) "
+            "ON DUPLICATE KEY UPDATE mode=VALUES(mode), day_of_week=VALUES(day_of_week), "
+            "day_of_month=VALUES(day_of_month), hour=VALUES(hour), size_bytes=VALUES(size_bytes)",
+            (game_id, mode, day_of_week, day_of_month, hour, size_bytes),
+        )
+    conn.commit()
+
+
+def trigger_rotation_now(conn, game_id: int):
+    """Sets/refreshes this game's manual rotation trigger -- honored by
+    tail_log_source regardless of its configured mode. Leaves mode/other
+    columns alone if a row already exists (ON DUPLICATE KEY only touches
+    manual_trigger_at); the mode='manual' in the INSERT list only applies
+    the first time a game gets a row at all."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO rotation_settings (game_id, mode, manual_trigger_at) "
+            "VALUES (%s, 'manual', UTC_TIMESTAMP()) "
+            "ON DUPLICATE KEY UPDATE manual_trigger_at=UTC_TIMESTAMP()",
+            (game_id,),
+        )
+    conn.commit()
+
+
+def mark_log_source_rotated(conn, log_source_id: int, offset: int):
+    """Called right after a log rotation: resets the byte offset for the
+    now-empty file and records the rotation in UTC so it survives a tailer
+    restart -- see tailer.py's _rotation_due, which compares this against
+    the game's configured rotation policy (or a manual trigger) to decide
+    whether a rotation is overdue, catching up even after the tailer was off
+    for days."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE log_sources SET last_byte_offset=%s, last_parsed_at=NOW(), last_rotated_at=UTC_TIMESTAMP() "
+            "WHERE id=%s",
             (offset, log_source_id),
         )
     conn.commit()
