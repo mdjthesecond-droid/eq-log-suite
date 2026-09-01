@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from eq_log_suite import db
+from eq_log_suite.overlay import boxes as overlay_boxes
 from eq_log_suite.parsers.base import GameParser
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -3325,10 +3326,13 @@ def alerts_list(request: Request):
             games = cur.fetchall()
     finally:
         conn.close()
-    return templates.TemplateResponse(request, "alerts.html", {"rules": rules, "log": log, "games": games})
+    return templates.TemplateResponse(
+        request, "alerts.html",
+        {"rules": rules, "log": log, "games": games, "boxes": overlay_boxes.BOXES},
+    )
 
 
-def _reaction_config(sound_file: str, overlay_text: str, duration_seconds: str, countdown: bool) -> dict:
+def _reaction_config(sound_file: str, overlay_text: str, duration_seconds: str, countdown: bool, box: str) -> dict:
     reaction_config = {}
     if sound_file:
         reaction_config["sound_file"] = sound_file
@@ -3338,6 +3342,8 @@ def _reaction_config(sound_file: str, overlay_text: str, duration_seconds: str, 
         reaction_config["duration_seconds"] = int(duration_seconds)
     if countdown:
         reaction_config["countdown"] = True
+    if box:
+        reaction_config["box"] = box
     return reaction_config
 
 
@@ -3347,9 +3353,9 @@ def alerts_create(
     match_type: str = Form(...), pattern: str = Form(...),
     reaction_types: list[str] = Form([]), sound_file: str = Form(""),
     overlay_text: str = Form(""), duration_seconds: str = Form(""),
-    countdown: bool = Form(False), cooldown_seconds: int = Form(0),
+    countdown: bool = Form(False), cooldown_seconds: int = Form(0), box: str = Form(""),
 ):
-    reaction_config = _reaction_config(sound_file, overlay_text, duration_seconds, countdown)
+    reaction_config = _reaction_config(sound_file, overlay_text, duration_seconds, countdown, box)
 
     conn = db.get_connection()
     try:
@@ -3377,9 +3383,9 @@ def alerts_update(
     match_type: str = Form(...), pattern: str = Form(...),
     reaction_types: list[str] = Form([]), sound_file: str = Form(""),
     overlay_text: str = Form(""), duration_seconds: str = Form(""),
-    countdown: bool = Form(False), cooldown_seconds: int = Form(0),
+    countdown: bool = Form(False), cooldown_seconds: int = Form(0), box: str = Form(""),
 ):
-    reaction_config = _reaction_config(sound_file, overlay_text, duration_seconds, countdown)
+    reaction_config = _reaction_config(sound_file, overlay_text, duration_seconds, countdown, box)
 
     conn = db.get_connection()
     try:

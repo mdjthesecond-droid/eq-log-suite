@@ -135,8 +135,9 @@ DPS_TICK_INTERVAL = 0.5
 # only decides when combat itself is considered over.
 COMBAT_ALERT_DURATION_SECONDS = 10.0
 # Off by default -- was useful to confirm CombatTracker/DPSTracker work
-# correctly, but competes with real alert rules for screen space now that
-# those exist. Flip back to True to re-enable.
+# correctly, but the user doesn't want a dedicated in/out-of-combat box
+# any more now that fixed, user-assignable alert boxes exist (see
+# eq_log_suite/overlay/boxes.py). Flip back to True to re-enable.
 COMBAT_STATE_ALERTS_ENABLED = False
 
 
@@ -227,6 +228,7 @@ class DPSTracker:
         elapsed = max(end - self.start_time, 0.1)
         return {
             "kind": "dps",
+            "key": "dps_meter",
             "label": self.label,
             "state": "active" if self.active else "paused",
             "damage": self.total_damage,
@@ -270,6 +272,47 @@ class CombatTracker:
         return len(self.mobs)
 
 
+class MobDamageTracker:
+    """Tracks cumulative damage taken by each currently-engaged mob, from
+    any source -- you, another party member, or (per the same classify_actor
+    ambiguity CombatTracker/DPSTracker's party numbers already accept) a
+    pet or unique-named NPC ally. "The mob you're hitting" is just whichever
+    target you personally dealt damage to most recently; its running total
+    is everyone's damage against that specific name, not a fight-wide sum
+    across every mob in an AoE pull.
+    """
+
+    def __init__(self):
+        self.damage: dict[str, int] = {}
+        self.last_hit: dict[str, float] = {}
+        self.current_target: str | None = None
+
+    def record(self, target_name: str, amount: int, now: float, *, is_self: bool):
+        self.damage[target_name] = self.damage.get(target_name, 0) + amount
+        self.last_hit[target_name] = now
+        if is_self:
+            self.current_target = target_name
+
+    def clear(self, target_name: str):
+        """Drops a mob's tally -- called on its death so the next mob with
+        the same name (a fresh trash spawn) starts from zero, not wherever
+        the last one's health bar left off."""
+        self.damage.pop(target_name, None)
+        self.last_hit.pop(target_name, None)
+        if self.current_target == target_name:
+            self.current_target = None
+
+    def prune(self, now: float):
+        stale = [name for name, t in self.last_hit.items() if now - t > COMBAT_TIMEOUT_SECONDS]
+        for name in stale:
+            self.clear(name)
+
+    def current(self) -> tuple[str, int] | None:
+        if self.current_target is None:
+            return None
+        return self.current_target, self.damage.get(self.current_target, 0)
+
+
 class OverlayBroadcaster:
     def __init__(self):
         self.clients: set[asyncio.StreamWriter] = set()
@@ -307,6 +350,19 @@ async def tail_log_source(conn, log_source, broadcaster: OverlayBroadcaster):
     alert_engine = AlertEngine(conn, log_source["game_id"], broadcast=broadcaster.send)
     dps = DPSTracker(label=f"{character_name} ({game_code})")
     combat = CombatTracker(label=f"{character_name} ({game_code})")
+    mob_damage = MobDamageTracker()
+
+    def snapshot_with_target(t: float) -> dict | None:
+        """DPSTracker.snapshot() plus whichever mob you're currently hitting
+        and its total damage taken from all sources -- merged at the call
+        site rather than inside DPSTracker itself since target tracking is
+        keyed by mob name, not by character."""
+        msg = dps.snapshot(t)
+        if msg is not None:
+            current = mob_damage.current()
+            if current is not None:
+                msg["target_name"], msg["target_damage"] = current
+        return msg
     # The lookups above are all bare SELECTs with autocommit off, so without
     # this the transaction they opened just sits there -- holding a metadata
     # lock on games/characters/alert_rules -- for as long as the game stays
@@ -348,13 +404,15 @@ async def tail_log_source(conn, log_source, broadcaster: OverlayBroadcaster):
                 last_rotated_at = wall_now
                 db.mark_log_source_rotated(conn, log_source_id, offset)
 
+            mob_damage.prune(now)
+
             # DPS bookkeeping runs every iteration -- including idle ones --
             # so the timeout fires and the on-screen timer keeps ticking
             # even during gaps between hits, not just when a new line lands.
             if dps.check_timeout(now):
-                broadcaster.send(dps.snapshot(now))
+                broadcaster.send(snapshot_with_target(now))
             elif dps.active and now - dps.last_broadcast >= DPS_TICK_INTERVAL:
-                broadcaster.send(dps.snapshot(now))
+                broadcaster.send(snapshot_with_target(now))
                 dps.last_broadcast = now
 
             if combat.prune(now) and COMBAT_STATE_ALERTS_ENABLED:
@@ -403,7 +461,7 @@ async def tail_log_source(conn, log_source, broadcaster: OverlayBroadcaster):
                     # COMBAT_TIMEOUT_SECONDS gap, for dummy/gear-testing.
                     if event.verb == "start":
                         dps.force_start(now)
-                        broadcaster.send(dps.snapshot(now))
+                        broadcaster.send(snapshot_with_target(now))
                         dps.last_broadcast = now
                     elif event.verb == "stop":
                         snap = dps.force_stop(now)
@@ -421,8 +479,11 @@ async def tail_log_source(conn, log_source, broadcaster: OverlayBroadcaster):
                     elif event.event_type in ("spell_damage", "ability_damage") and event.amount is not None:
                         dps.record_damage(event.amount, now)
                         activity = True
+                    if (event.event_type in ("melee", "spell_damage", "ability_damage")
+                            and event.target_name and event.amount is not None):
+                        mob_damage.record(event.target_name, event.amount, now, is_self=True)
                     if activity:
-                        broadcaster.send(dps.snapshot(now))
+                        broadcaster.send(snapshot_with_target(now))
                         dps.last_broadcast = now
 
                     if event.event_type in ("melee", "spell_damage", "ability_damage") and event.target_name:
@@ -435,6 +496,24 @@ async def tail_log_source(conn, log_source, broadcaster: OverlayBroadcaster):
                                 "color": [0.9, 0.3, 0.2],
                                 "duration": COMBAT_ALERT_DURATION_SECONDS,
                             })
+
+                elif event.source_type == "unknown" and event.target_type == "npc":
+                    # Someone/something else (party member, pet, or a
+                    # unique-named NPC ally -- see classify_actor, log text
+                    # can't tell these apart) hitting a mob. Only feeds
+                    # mob_damage's per-target total, not your own DPS/hit/
+                    # crit numbers -- those stay yours alone.
+                    if (event.event_type in ("melee", "spell_damage", "ability_damage")
+                            and event.target_name and event.amount is not None):
+                        mob_damage.record(event.target_name, event.amount, now, is_self=False)
+                        if dps.active:
+                            broadcaster.send(snapshot_with_target(now))
+
+                if event.event_type == "death" and event.target_type == "npc" and event.target_name:
+                    # Mob's gone -- clear its tally so the next same-named
+                    # trash spawn starts from zero instead of inheriting
+                    # whatever health the last one had lost.
+                    mob_damage.clear(event.target_name)
     finally:
         f.close()
 

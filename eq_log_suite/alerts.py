@@ -131,11 +131,14 @@ class AlertEngine:
             )
             self.broadcast({
                 "kind": "alert",
-                # Identifies this alert's source so consumers can show
-                # multiple concurrent alerts side by side (different rules)
-                # while still replacing-in-place rather than duplicating
-                # when the *same* rule re-fires (e.g. a refreshed buff).
-                "key": f"rule_{rule['id']}",
+                # Which on-screen box this renders into. Defaults to a box
+                # implicitly owned by this rule alone (unchanged legacy
+                # behavior) -- but if the user assigned this rule to a
+                # fixed box via /alerts (reaction_config["box"], see
+                # eq_log_suite/overlay/boxes.py), several rules can share
+                # one box, replacing its content in place rather than each
+                # rule getting its own.
+                "key": config.get("box") or f"rule_{rule['id']}",
                 "text": text.format_map(fields),
                 "color": config.get("color", [0.9, 0.3, 0.2]),
                 "duration": config.get("duration_seconds", 6),

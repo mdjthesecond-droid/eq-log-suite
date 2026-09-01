@@ -35,6 +35,21 @@
     <li><code>event_type=zone_change AND source_type=you</code> -- fires every time you zone.</li>
   </ul>
 </details>
+
+<h2>Overlay boxes</h2>
+<p>A fixed set of positionable on-screen boxes -- position them from the native overlay's companion
+app (<code>bin/start-overlay-native.sh</code>). Assign an alert's <code>overlay</code> reaction to
+one below so several rules can share a box; unassigned rules still get their own implicit box.</p>
+<table class="wrap-table">
+  <thead><tr><th>key</th><th>name</th></tr></thead>
+  <tbody>
+    {% for b in boxes %}
+    <tr><td><code>{{ b.key }}</code></td><td>{{ b.name }}</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<h2>Rules</h2>
 <form method="post" action="/alerts/create">
   <input name="name" placeholder="name" required>
   <input name="description" placeholder="description">
@@ -55,19 +70,24 @@
   <input name="overlay_text" placeholder="overlay text override (optional)">
   <input name="duration_seconds" type="number" placeholder="overlay duration (s, default 6)">
   <label title="counts down instead of showing static text -- duration above becomes the countdown length"><input type="checkbox" name="countdown"> countdown</label>
+  <select name="box" title="which fixed overlay box this rule's alerts render into (overlay reaction only)">
+    <option value="">own box (default)</option>
+    {% for b in boxes %}<option value="{{ b.key }}">{{ b.name }}</option>{% endfor %}
+  </select>
   <input name="cooldown_seconds" type="number" value="0" placeholder="cooldown (s)">
   <button type="submit">Create</button>
 </form>
 
 <table class="sortable">
   <thead>
-    <tr><th>id</th><th>name</th><th>game</th><th>match_type</th><th>pattern</th><th>reactions</th><th>cooldown</th><th>enabled</th><th></th></tr>
+    <tr><th>id</th><th>name</th><th>game</th><th>match_type</th><th>pattern</th><th>reactions</th><th>box</th><th>cooldown</th><th>enabled</th><th></th></tr>
   </thead>
   <tbody>
     {% for r in rules %}
     <tr>
       <td>{{ r.id }}</td><td>{{ r.name }}</td><td>{{ r.game_code or 'all' }}</td>
       <td>{{ r.match_type }}</td><td>{{ r.pattern }}</td><td>{{ r.reaction_types }}</td>
+      <td>{{ r.reaction_config_dict.box or '' }}</td>
       <td>{{ r.cooldown_seconds }}</td><td>{{ 'yes' if r.enabled else 'no' }}</td>
       <td>
         <details>
@@ -92,6 +112,10 @@
             <input name="overlay_text" placeholder="overlay text override (optional)" value="{{ r.reaction_config_dict.overlay_text or '' }}">
             <input name="duration_seconds" type="number" placeholder="overlay duration (s, default 6)" value="{{ r.reaction_config_dict.duration_seconds or '' }}">
             <label title="counts down instead of showing static text -- duration above becomes the countdown length"><input type="checkbox" name="countdown" {{ 'checked' if r.reaction_config_dict.countdown }}> countdown</label>
+            <select name="box" title="which fixed overlay box this rule's alerts render into (overlay reaction only)">
+              <option value="">own box (default)</option>
+              {% for b in boxes %}<option value="{{ b.key }}" {{ 'selected' if r.reaction_config_dict.box == b.key }}>{{ b.name }}</option>{% endfor %}
+            </select>
             <input name="cooldown_seconds" type="number" value="{{ r.cooldown_seconds }}" placeholder="cooldown (s)">
             <button type="submit">Save</button>
           </form>

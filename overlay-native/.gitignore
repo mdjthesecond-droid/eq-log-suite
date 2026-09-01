@@ -1,0 +1,4 @@
+build/
+subprojects/imgui-*/
+subprojects/packagecache/
+subprojects/.wraplock

@@ -1,0 +1,23 @@
+{
+    "file_format_version": "1.2.0",
+    "layer": {
+        "name": "VK_LAYER_EQLOG_overlay",
+        "type": "GLOBAL",
+        "library_path": "./libeq_overlay_layer.so",
+        "api_version": "1.4.0",
+        "implementation_version": "1",
+        "description": "eq-log-suite alert overlay (phase-1 spike, not derived from MangoHud)",
+        "enable_environment": {
+            "EQLOG_OVERLAY_ENABLE": "1"
+        },
+        "disable_environment": {
+            "DISABLE_EQLOG_OVERLAY": "1"
+        },
+        "functions": {
+            "vkGetInstanceProcAddr": "EQLOG_Overlay_GetInstanceProcAddr",
+            "vkGetDeviceProcAddr": "EQLOG_Overlay_GetDeviceProcAddr",
+            "vkEnumerateInstanceLayerProperties": "EQLOG_Overlay_EnumerateInstanceLayerProperties",
+            "vkEnumerateInstanceExtensionProperties": "EQLOG_Overlay_EnumerateInstanceExtensionProperties"
+        }
+    }
+}
