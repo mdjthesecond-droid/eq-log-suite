@@ -61,7 +61,19 @@ CREATE TABLE IF NOT EXISTS events (
     -- (2026-08-24): dropped this query from 7.66s to 2.23s on ~2.7M eql
     -- events.
     INDEX idx_game_type_source (game_id, event_type, source_name),
-    INDEX idx_game_type_target (game_id, event_type, target_name)
+    INDEX idx_game_type_target (game_id, event_type, target_name),
+    -- /events with no filters ("browse recent activity") does
+    -- ORDER BY ts DESC LIMIT n across every game/character with no WHERE
+    -- clause at all -- none of the indexes above have ts as a leading
+    -- column, so that was a full table scan + filesort (confirmed real,
+    -- 2026-09-07: 4s against ~2.65M rows). This lets it walk the index
+    -- backwards instead.
+    INDEX idx_ts (ts),
+    -- _known_logs() (the /encounters log picker) computes MIN/MAX/COUNT of
+    -- ts grouped by log_source_id, with no date bound, just to populate a
+    -- dropdown -- confirmed real, 2026-09-07: 7.5s. This makes that an
+    -- index-only aggregate per log source instead of a table scan.
+    INDEX idx_log_source_ts (log_source_id, ts)
 ) ENGINE=InnoDB;
 
 CREATE TABLE IF NOT EXISTS raw_lines (

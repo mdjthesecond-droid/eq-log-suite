@@ -3,7 +3,7 @@ import json
 import os
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
 
@@ -62,6 +62,59 @@ def _unresolved_zone_starts(game):
             return cur.fetchall()
     finally:
         conn.close()
+
+
+def _fetch_zone_at(game, character=""):
+    """Same correlation as _ZONE_LOOKUP_EXPR (most recent zone_change at or
+    before ts, falling back to zone_start_overrides for the leading gap
+    before a character's first-ever zone_change) but fetched once and
+    resolved with bisect in Python instead of as a per-row correlated SQL
+    subquery. Confirmed real (2026-09-07): /tasks/eq and /quests/eql, which
+    embedded that subquery once (tasks) and six times over per-branch
+    UNIONs (quests) with no date/character narrowing before it ran, took
+    62s and 19s respectively against a real ~2.65M-row events table --
+    same root cause already fixed for /loot, just not carried over here.
+    Returns a zone_at(character_id, ts) closure."""
+    clauses, params = ["g.code = %s"], [game]
+    if character:
+        clauses.append("c.name = %s"); params.append(character)
+    where = f"AND {' AND '.join(clauses)}"
+
+    conn = db.get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT ev.character_id, ev.ts, ev.target_name AS zone "
+                "FROM events ev JOIN games g ON ev.game_id=g.id JOIN characters c ON ev.character_id=c.id "
+                f"WHERE ev.event_type='zone_change' {where} ORDER BY ev.character_id, ev.ts",
+                params,
+            )
+            zone_changes = cur.fetchall()
+            cur.execute(
+                "SELECT zso.character_id, zso.zone FROM zone_start_overrides zso "
+                "JOIN characters c ON zso.character_id=c.id JOIN games g ON c.game_id=g.id "
+                f"WHERE {' AND '.join(clauses)}",
+                params,
+            )
+            overrides = {r["character_id"]: r["zone"] for r in cur.fetchall()}
+    finally:
+        conn.close()
+
+    zc_by_char: dict = {}
+    for r in zone_changes:
+        zc = zc_by_char.setdefault(r["character_id"], {"ts": [], "zone": []})
+        zc["ts"].append(r["ts"])
+        zc["zone"].append(r["zone"])
+
+    def zone_at(character_id, ts):
+        zc = zc_by_char.get(character_id)
+        if zc:
+            i = bisect.bisect_right(zc["ts"], ts) - 1
+            if i >= 0:
+                return zc["zone"][i]
+        return overrides.get(character_id)
+
+    return zone_at
 
 
 @app.post("/zone-start/set")
@@ -204,12 +257,29 @@ def events_browse(
 
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     limit = max(1, min(limit, 5000))
-    sql = (
-        "SELECT e.id, e.ts, g.code AS game, c.name AS character_name, e.event_type, e.source_name, "
-        "e.source_type, e.target_name, e.target_type, e.verb, e.amount, e.outcome, e.raw_line "
-        "FROM events e JOIN games g ON e.game_id=g.id JOIN characters c ON e.character_id=c.id "
-        f"{where} ORDER BY e.ts DESC LIMIT {limit}"
-    )
+    if clauses:
+        sql = (
+            "SELECT e.id, e.ts, g.code AS game, c.name AS character_name, e.event_type, e.source_name, "
+            "e.source_type, e.target_name, e.target_type, e.verb, e.amount, e.outcome, e.raw_line "
+            "FROM events e JOIN games g ON e.game_id=g.id JOIN characters c ON e.character_id=c.id "
+            f"{where} ORDER BY e.ts DESC LIMIT {limit}"
+        )
+    else:
+        # No filters -- "browse recent activity" across every game/character.
+        # With no WHERE to narrow it, none of the game/character-scoped
+        # indexes below help; the planner instead drove the join from the
+        # tiny `games` table and filesorted the whole result to get the
+        # top N by ts (confirmed real, 2026-09-07: 5.8s over ~2.65M rows).
+        # STRAIGHT_JOIN + FORCE INDEX pins the join to start from `events`
+        # via idx_ts, walking it backwards and stopping at `limit` -- 0.01s
+        # against the same data.
+        sql = (
+            "SELECT STRAIGHT_JOIN e.id, e.ts, g.code AS game, c.name AS character_name, e.event_type, "
+            "e.source_name, e.source_type, e.target_name, e.target_type, e.verb, e.amount, e.outcome, e.raw_line "
+            "FROM events e FORCE INDEX (idx_ts) "
+            "JOIN games g ON e.game_id=g.id JOIN characters c ON e.character_id=c.id "
+            f"ORDER BY e.ts DESC LIMIT {limit}"
+        )
 
     conn = db.get_connection()
     try:
@@ -552,52 +622,95 @@ def _compute_tasks(game, character="", task="", npc="", zone=""):
         inner_clauses.append("c.name = %s"); inner_params.append(character)
     inner_where = f"AND {' AND '.join(inner_clauses)}"
 
-    outer_clauses, outer_params = [], []
-    if task:
-        outer_clauses.append("task LIKE %s"); outer_params.append(f"%{task}%")
-    if npc:
-        outer_clauses.append("npc LIKE %s"); outer_params.append(f"%{npc}%")
-    if zone:
-        outer_clauses.append("zone LIKE %s"); outer_params.append(f"%{zone}%")
-    outer_where = f"WHERE {' AND '.join(outer_clauses)}" if outer_clauses else ""
-
-    sql = (
-        "SELECT * FROM ("
-        "  SELECT ev.character_id AS character_id, ev.ts AS assigned_at, c.name AS character_name, "
-        f"    ev.target_name AS task, {_ZONE_LOOKUP_EXPR} AS zone, "
-        "    (SELECT nd.source_name FROM events nd WHERE nd.event_type='npc_dialogue' "
-        "       AND nd.character_id=ev.character_id AND nd.ts<=ev.ts ORDER BY nd.ts DESC LIMIT 1) AS npc, "
-        "    (SELECT r.ts FROM events r WHERE r.event_type='task_reward' "
-        "       AND r.character_id=ev.character_id AND r.target_name=ev.target_name "
-        "       AND r.ts>=ev.ts ORDER BY r.ts ASC LIMIT 1) AS reward_at "
-        "  FROM events ev JOIN games g ON ev.game_id=g.id JOIN characters c ON ev.character_id=c.id "
-        f"  WHERE ev.event_type='task_assigned' {inner_where}"
-        ") t "
-        f"{outer_where} ORDER BY assigned_at DESC"
-    )
-
     conn = db.get_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute(sql, inner_params + outer_params)
-            rows = list(cur.fetchall())
-
-            # Window boundaries for attaching updates to the right assignment
-            # (a task name can be assigned more than once over a character's
-            # lifetime -- dailies, or a sub-task reused across an arc) come
-            # from EVERY assignment of that character+task, not just the
-            # ones surviving the outer task/npc/zone filter above, or a
-            # narrow npc/zone search could cut a window short and misattach
-            # an update to the wrong assignment.
+            # Unfiltered by task/npc/zone -- those apply in Python below,
+            # after correlation, the same way the outer SQL WHERE used to
+            # apply after the subquery-correlated inner SELECT. Also doubles
+            # as the window-boundary source a few lines down (every
+            # assignment of that character+task, not just ones surviving the
+            # task/npc/zone filter, or a narrow search could cut a window
+            # short and misattach an update to the wrong assignment).
             cur.execute(
-                "SELECT ev.character_id, ev.target_name AS task, ev.ts AS assigned_at "
+                "SELECT ev.character_id AS character_id, ev.ts AS assigned_at, c.name AS character_name, "
+                "ev.target_name AS task "
                 "FROM events ev JOIN games g ON ev.game_id=g.id JOIN characters c ON ev.character_id=c.id "
                 f"WHERE ev.event_type='task_assigned' {inner_where}",
                 inner_params,
             )
-            all_assignments = cur.fetchall()
+            all_assignments = list(cur.fetchall())
+
+            cur.execute(
+                "SELECT ev.character_id, ev.ts, ev.source_name "
+                "FROM events ev JOIN games g ON ev.game_id=g.id JOIN characters c ON ev.character_id=c.id "
+                f"WHERE ev.event_type='npc_dialogue' {inner_where}",
+                inner_params,
+            )
+            npc_dialogue_rows = cur.fetchall()
+
+            cur.execute(
+                "SELECT ev.character_id, ev.ts, ev.target_name AS task "
+                "FROM events ev JOIN games g ON ev.game_id=g.id JOIN characters c ON ev.character_id=c.id "
+                f"WHERE ev.event_type='task_reward' {inner_where}",
+                inner_params,
+            )
+            reward_rows = cur.fetchall()
     finally:
         conn.close()
+
+    zone_at = _fetch_zone_at(game, character)
+
+    # npc: most recent npc_dialogue.source_name at/before assigned_at, per
+    # character -- same bisect technique as zone_at, replacing what used to
+    # be a correlated subquery evaluated once per task_assigned row.
+    npc_pairs_by_char: dict = {}
+    for r in npc_dialogue_rows:
+        npc_pairs_by_char.setdefault(r["character_id"], []).append((r["ts"], r["source_name"]))
+    for pairs in npc_pairs_by_char.values():
+        pairs.sort(key=lambda p: p[0])
+    npc_ts_by_char = {cid: [ts for ts, _ in pairs] for cid, pairs in npc_pairs_by_char.items()}
+
+    def npc_at(character_id, ts):
+        pairs = npc_pairs_by_char.get(character_id)
+        if not pairs:
+            return None
+        i = bisect.bisect_right(npc_ts_by_char[character_id], ts) - 1
+        return pairs[i][1] if i >= 0 else None
+
+    # reward_at: nearest task_reward.ts at/after assigned_at, matched on
+    # (character_id, task name) -- same match the old correlated subquery
+    # used (r.target_name=ev.target_name AND r.ts>=ev.ts), just resolved
+    # once here instead of per row.
+    reward_ts_by_key: dict = {}
+    for r in reward_rows:
+        reward_ts_by_key.setdefault((r["character_id"], r["task"]), []).append(r["ts"])
+    for lst in reward_ts_by_key.values():
+        lst.sort()
+
+    def reward_at(character_id, task_name, ts):
+        lst = reward_ts_by_key.get((character_id, task_name))
+        if not lst:
+            return None
+        i = bisect.bisect_left(lst, ts)
+        return lst[i] if i < len(lst) else None
+
+    for r in all_assignments:
+        r["zone"] = zone_at(r["character_id"], r["assigned_at"])
+        r["npc"] = npc_at(r["character_id"], r["assigned_at"])
+        r["reward_at"] = reward_at(r["character_id"], r["task"], r["assigned_at"])
+
+    rows = all_assignments
+    if task:
+        needle = task.lower()
+        rows = [r for r in rows if needle in (r["task"] or "").lower()]
+    if npc:
+        needle = npc.lower()
+        rows = [r for r in rows if needle in (r["npc"] or "").lower()]
+    if zone:
+        needle = zone.lower()
+        rows = [r for r in rows if needle in (r["zone"] or "").lower()]
+    rows.sort(key=lambda r: r["assigned_at"], reverse=True)
 
     windows = {}  # (character_id, task) -> sorted list of assigned_at
     for a in all_assignments:
@@ -671,18 +784,10 @@ def _compute_dialogue(game, character="", npc="", zone="", exclude_chatter=False
         inner_clauses.append("c.name = %s"); inner_params.append(character)
     inner_where = f"AND {' AND '.join(inner_clauses)}"
 
-    outer_clauses, outer_params = [], []
-    if npc:
-        outer_clauses.append("npc LIKE %s"); outer_params.append(f"%{npc}%")
-    if zone:
-        outer_clauses.append("zone LIKE %s"); outer_params.append(f"%{zone}%")
-    outer_where = f"WHERE {' AND '.join(outer_clauses)}" if outer_clauses else ""
-
     def branch(event_type, npc_expr, text_expr):
         return (
-            "SELECT ev.ts, c.name AS character_name, ev.event_type AS kind, "
-            f"{npc_expr} AS npc, {text_expr} AS text, ev.amount AS amount, "
-            f"{_ZONE_LOOKUP_EXPR} AS zone "
+            "SELECT ev.character_id AS character_id, ev.ts, c.name AS character_name, ev.event_type AS kind, "
+            f"{npc_expr} AS npc, {text_expr} AS text, ev.amount AS amount "
             "FROM events ev JOIN games g ON ev.game_id=g.id JOIN characters c ON ev.character_id=c.id "
             f"WHERE ev.event_type='{event_type}' {inner_where}"
         )
@@ -699,17 +804,39 @@ def _compute_dialogue(game, character="", npc="", zone="", exclude_chatter=False
         # marker that an offer succeeded.
         branch("trade_complete", "ev.target_name", "NULL"),
     ]
-    sql = "SELECT * FROM (" + " UNION ALL ".join(branches) + ") t " + f"{outer_where} ORDER BY character_name, ts"
+    sql = "SELECT * FROM (" + " UNION ALL ".join(branches) + ") t ORDER BY character_name, ts"
 
     conn = db.get_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute(sql, (inner_params * len(branches)) + outer_params)
+            cur.execute(sql, inner_params * len(branches))
             # pymysql's fetchall() returns () for zero rows but a list for
             # one-or-more -- list() here so the `rows + reward_extras` below
             # doesn't blow up on any NPC with no dialogue lines at all (i.e.
             # most plain combat mobs).
             rows = list(cur.fetchall())
+
+            # zone can no longer be a SQL column selected per-branch above
+            # (see _fetch_zone_at) -- resolved once via bisect instead of a
+            # correlated subquery embedded in each of the 6 UNION branches.
+            # Confirmed real (2026-09-07): that was 19s on /quests/eql with
+            # no character filter at all -- six unfiltered correlated scans
+            # over the whole events table.
+            zone_at = _fetch_zone_at(game, character)
+            for r in rows:
+                r["zone"] = zone_at(r["character_id"], r["ts"])
+
+            # npc/zone filters -- applied here in Python (zone has to be,
+            # now that it's not a SQL column; npc moved alongside it for one
+            # consistent filtering step) before any of the trade-reward/
+            # dedup/chatter logic below, same as the outer SQL WHERE used to
+            # run before any of that.
+            if npc:
+                needle = npc.lower()
+                rows = [r for r in rows if r["npc"] and needle in r["npc"].lower()]
+            if zone:
+                needle = zone.lower()
+                rows = [r for r in rows if needle in (r["zone"] or "").lower()]
 
             # The reward for a trade isn't always the currency-from-npc
             # `reward` event -- confirmed real: the one trade in the log
@@ -718,9 +845,8 @@ def _compute_dialogue(game, character="", npc="", zone="", exclude_chatter=False
             # adjustment, or several of these at once (XP + faction + a
             # `reward` row, all for the same trade). None of those carry an
             # npc of their own, so they're fetched separately (scoped only
-            # by character/game, not npc/zone -- those filters apply below,
-            # after attaching them to whichever trade_complete they belong
-            # to) and matched to the nearest trade_complete within
+            # by character/game, not npc/zone -- those filters already ran
+            # above) and matched to the nearest trade_complete within
             # TRADE_REWARD_WINDOW_S for the same character.
             exp_rows = faction_rows = []
             if any(r["kind"] == "trade_complete" for r in rows):
@@ -745,23 +871,50 @@ def _compute_dialogue(game, character="", npc="", zone="", exclude_chatter=False
     # in the same second as "You complete the trade..."; generous margin
     # against timing jitter without reaching into unrelated combat XP/faction.
 
+    # Matching every trade_complete against every exp/faction row (both
+    # unfiltered by npc/zone, and -- since this app is usually one
+    # character's whole history -- effectively all under one character
+    # name) was an O(trade_complete x (exp+faction)) nested loop: confirmed
+    # real, 2026-09-07, 742 trade_completes x ~14.5k exp+faction rows (all
+    # one character) was ~10.8M comparisons, ~3.7s of /quests/eql's
+    # remaining time even after the zone-lookup fix above. Grouped by
+    # character and sorted by ts here so each trade_complete only bisects
+    # into its own character's window instead of scanning every row.
+    def _by_char_sorted_ts(table):
+        by_char: dict = {}
+        for r in table:
+            by_char.setdefault(r["character_name"], []).append(r)
+        for lst in by_char.values():
+            lst.sort(key=lambda r: r["ts"])
+        return by_char, {name: [r["ts"] for r in lst] for name, lst in by_char.items()}
+
+    exp_by_char, exp_ts_by_char = _by_char_sorted_ts(exp_rows)
+    faction_by_char, faction_ts_by_char = _by_char_sorted_ts(faction_rows)
+    window = timedelta(seconds=TRADE_REWARD_WINDOW_S)
+
+    def _within_window(rows_by_char, ts_by_char, character_name, center_ts):
+        ts_list = ts_by_char.get(character_name)
+        if not ts_list:
+            return []
+        lo = bisect.bisect_left(ts_list, center_ts - window)
+        hi = bisect.bisect_right(ts_list, center_ts + window)
+        return rows_by_char[character_name][lo:hi]
+
     reward_extras = []
     for tc in (r for r in rows if r["kind"] == "trade_complete"):
-        for er in exp_rows:
-            if er["character_name"] == tc["character_name"] and abs((er["ts"] - tc["ts"]).total_seconds()) <= TRADE_REWARD_WINDOW_S:
-                reward_extras.append({
-                    "ts": er["ts"], "character_name": tc["character_name"], "kind": "exp",
-                    "npc": tc["npc"], "zone": tc["zone"],
-                    "text": f'{float(er["percent"]):.3g}% experience', "amount": None,
-                })
-        for fr in faction_rows:
-            if fr["character_name"] == tc["character_name"] and abs((fr["ts"] - tc["ts"]).total_seconds()) <= TRADE_REWARD_WINDOW_S:
-                sign = "+" if fr["delta"] >= 0 else ""
-                reward_extras.append({
-                    "ts": fr["ts"], "character_name": tc["character_name"], "kind": "faction",
-                    "npc": tc["npc"], "zone": tc["zone"],
-                    "text": f'{fr["faction"]} {sign}{fr["delta"]}', "amount": None,
-                })
+        for er in _within_window(exp_by_char, exp_ts_by_char, tc["character_name"], tc["ts"]):
+            reward_extras.append({
+                "ts": er["ts"], "character_name": tc["character_name"], "kind": "exp",
+                "npc": tc["npc"], "zone": tc["zone"],
+                "text": f'{float(er["percent"]):.3g}% experience', "amount": None,
+            })
+        for fr in _within_window(faction_by_char, faction_ts_by_char, tc["character_name"], tc["ts"]):
+            sign = "+" if fr["delta"] >= 0 else ""
+            reward_extras.append({
+                "ts": fr["ts"], "character_name": tc["character_name"], "kind": "faction",
+                "npc": tc["npc"], "zone": tc["zone"],
+                "text": f'{fr["faction"]} {sign}{fr["delta"]}', "amount": None,
+            })
     rows = sorted(rows + reward_extras, key=lambda r: (r["character_name"], r["ts"]))
 
     # Collapse repeats of the exact same line (everything but ts) -- e.g. a
@@ -2360,18 +2513,25 @@ def _known_logs():
     # by log instead of guessing a date range blind. file_mtime comes from
     # the filesystem (matches discovery.py's live-file resolution), not the
     # DB, so it reflects reality even if the tailer's been down a while.
+    # MIN/MAX/COUNT as correlated subqueries per log_source, rather than a
+    # single LEFT JOIN + GROUP BY over all of `events` -- the reverse of the
+    # per-row correlated-subquery antipattern elsewhere in this file: here
+    # the outer table (log_sources) has a handful of rows, so a subquery
+    # per row is cheap, while the GROUP BY version still had to aggregate
+    # every one of ~2.65M event rows to produce the same numbers (confirmed
+    # real, 2026-09-07: 6.7s vs. 0.9s for the same result on the same data).
     conn = db.get_connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT ls.id, ls.file_path, ls.last_parsed_at, ls.live, "
                 "c.name AS character_name, g.code AS game, "
-                "MIN(e.ts) AS first_event_ts, MAX(e.ts) AS last_event_ts, COUNT(e.id) AS event_count "
+                "(SELECT MIN(ts) FROM events WHERE log_source_id=ls.id) AS first_event_ts, "
+                "(SELECT MAX(ts) FROM events WHERE log_source_id=ls.id) AS last_event_ts, "
+                "(SELECT COUNT(*) FROM events WHERE log_source_id=ls.id) AS event_count "
                 "FROM log_sources ls "
                 "JOIN characters c ON ls.character_id=c.id "
-                "JOIN games g ON ls.game_id=g.id "
-                "LEFT JOIN events e ON e.log_source_id=ls.id "
-                "GROUP BY ls.id, ls.file_path, ls.last_parsed_at, ls.live, c.name, g.code"
+                "JOIN games g ON ls.game_id=g.id"
             )
             rows = cur.fetchall()
     finally:
