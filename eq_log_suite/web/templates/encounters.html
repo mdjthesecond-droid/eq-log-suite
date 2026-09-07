@@ -233,6 +233,14 @@ a few weeks of history.</p>
         wireMobSelect(mobCheckbox, details, { ...baseParams, npc: m.mob });
         tr.firstElementChild.appendChild(mobCheckbox);
 
+        const mobBreakdownLink = document.createElement("a");
+        mobBreakdownLink.href = `/encounters/breakdown?${new URLSearchParams({ ...baseParams, npc: m.mob })}`;
+        mobBreakdownLink.target = "_blank";
+        mobBreakdownLink.textContent = "↗";
+        mobBreakdownLink.title = `full breakdown for ${m.mob}`;
+        mobBreakdownLink.style.marginLeft = "0.3rem";
+        tr.firstElementChild.appendChild(mobBreakdownLink);
+
         const logRow = document.createElement("tr");
         const logCell = document.createElement("td");
         logCell.colSpan = 14;
