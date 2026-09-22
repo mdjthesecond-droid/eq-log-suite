@@ -1210,23 +1210,114 @@ def _base_zone_expr(alias="ev"):
     )
 
 
-def _tier_solo_exprs(alias="ev"):
-    # tier/solo from the same "most recent zone_change" correlation as
-    # _base_zone_expr, kept as independent correlated subqueries rather than
-    # one combined lookup for simplicity -- in practice a character's
-    # zone_change rows are never close enough in time for the
-    # ORDER BY ts DESC LIMIT 1 tie-break to matter.
-    tier = (
+def _tier_expr(alias="ev"):
+    # Same correlated "most recent zone_change" lookup as _base_zone_expr,
+    # for tier only -- used by _compute_npc_detail's loot-tier breakdown,
+    # which _zone_window_where's per-zone time-window approach doesn't fit
+    # (there's no single zone to window; it's one NPC's loot across
+    # whichever zones/tiers it's been looted in). Left as a correlated
+    # subquery rather than converted to the bisect pattern: unlike the zone
+    # detail page (which correlated ~27k zone-wide rows against the whole
+    # events table), every caller here scopes by source_name first via
+    # idx_game_type_source, so the correlation only ever runs over one
+    # NPC's own events -- confirmed real (2026-09-22): 0.08s for a
+    # 64-loot-row NPC (Phinigel Autropos), 0.62s for the single worst case
+    # in eql's data (a fire giant warrior, 507 loot rows). Not the same bug
+    # as [[feedback-correlated-subquery-per-row-not-per-group]].
+    return (
         "(SELECT JSON_EXTRACT(z.extra,'$.tier') FROM events z "
         f"WHERE z.event_type='zone_change' AND z.character_id={alias}.character_id "
         f"AND z.ts<={alias}.ts ORDER BY z.ts DESC LIMIT 1)"
     )
-    solo = (
-        "(SELECT JSON_EXTRACT(z.extra,'$.solo') FROM events z "
-        f"WHERE z.event_type='zone_change' AND z.character_id={alias}.character_id "
-        f"AND z.ts<={alias}.ts ORDER BY z.ts DESC LIMIT 1)"
-    )
-    return tier, solo
+
+
+def _zone_window_where(game, zone, tier="all", solo="any", alias="ev"):
+    """A (where_sql, params) fragment matching events that happened in
+    `zone` -- optionally narrowed to one tier/solo variant -- expressed as
+    per-character time windows resolved in Python from a single bulk
+    zone_change fetch, instead of correlating every candidate row back to
+    its most recent zone_change in SQL (_base_zone_expr(), plus the two
+    matching tier/solo subqueries this replaced).
+
+    Confirmed real (2026-09-22): /zoneinfo/eql/detail?zone=Kedge Keep took
+    51s, 46s of it inside two queries that ran those correlated subqueries
+    once per candidate row. The subquery is the trap even though it looks
+    indexed: idx_char_ts seeks straight to the character's rows at or
+    before ev.ts, but nothing indexes event_type within that, so each of
+    the ~27k con/npc_dialogue/death/loot rows scans backwards through that
+    character's whole history (2.3M melee rows, for eql) to find the one
+    zone_change. Cost scales with total logged events, not with the zone --
+    every zone, real or nonexistent, took the same ~50s. Same root cause
+    and fix as [[feedback-correlated-subquery-per-row-not-per-group]],
+    already applied in _compute_zone_list/_fetch_zone_at; doing it as a
+    WHERE fragment rather than a Python-side filter keeps every caller's
+    GROUP BY/aggregation in SQL untouched. 32.2s -> 0.09s for the NPC
+    query, 51s -> 1.3s for the page.
+
+    Each matching zone_change opens a window running until that character's
+    next zone_change of any kind (or forever, for their most recent one);
+    adjacent windows are merged, so the fragment stays small -- 55 Kedge
+    Keep visits collapse to 27 windows.
+    """
+    conn = db.get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT ev.character_id, ev.ts, ev.extra "
+                "FROM events ev JOIN games g ON ev.game_id=g.id "
+                "WHERE ev.event_type='zone_change' AND g.code=%s "
+                "ORDER BY ev.character_id, ev.ts",
+                (game,),
+            )
+            zone_changes = cur.fetchall()
+    finally:
+        conn.close()
+
+    by_char: dict = {}
+    for r in zone_changes:
+        by_char.setdefault(r["character_id"], []).append(r)
+
+    windows = []  # (character_id, start_ts, end_ts or None)
+    for character_id, changes in by_char.items():
+        for i, r in enumerate(changes):
+            extra = json.loads(r["extra"]) if r["extra"] else {}
+            if extra.get("base_zone") != zone:
+                continue
+            # Mirrors the COALESCE(..., 0) / COALESCE(..., false) the SQL
+            # tier/solo comparisons used: a zone_change with no tier/solo
+            # in its extra is the plain, non-solo tier 0 version of the zone.
+            if tier != "all" and (extra.get("tier") or 0) != int(tier):
+                continue
+            # Doing the solo test here also fixes it. COALESCE() strips
+            # JSON_EXTRACT's JSON typing down to a plain string (same trap
+            # as MAX() in the NPC query below, verified: COALESCE(
+            # JSON_EXTRACT('{"solo":true}','$.solo'), false) is the *string*
+            # 'true'), and pymysql sends a Python bool as 1/0 -- so the old
+            # `COALESCE(solo_expr, false) = %s` compared 'true'/'false'
+            # against 1/0 numerically, and both sides of that cast to 0.
+            # Solo-only therefore matched nothing at all and Group-only
+            # matched everything. The tier filter escaped it because
+            # COALESCE('4', 0) = 4 still compares numerically true.
+            if solo != "any" and bool(extra.get("solo")) != (solo == "1"):
+                continue
+            end = changes[i + 1]["ts"] if i + 1 < len(changes) else None
+            if windows and windows[-1][0] == character_id and windows[-1][2] == r["ts"]:
+                windows[-1] = (character_id, windows[-1][1], end)
+            else:
+                windows.append((character_id, r["ts"], end))
+
+    if not windows:
+        return "0", []
+
+    clauses, params = [], []
+    for character_id, start, end in windows:
+        if end is None:
+            clauses.append(f"({alias}.character_id=%s AND {alias}.ts>=%s)")
+            params += [character_id, start]
+        else:
+            clauses.append(f"({alias}.character_id=%s AND {alias}.ts>=%s AND {alias}.ts<%s)")
+            params += [character_id, start, end]
+    return "(" + " OR ".join(clauses) + ")", params
 
 
 def _compute_zone_list(game):
@@ -1597,13 +1688,7 @@ def _compute_zone_connections(game):
 
 
 def _compute_zone_detail(game, zone, tier="all", solo="any"):
-    tier_expr, solo_expr = _tier_solo_exprs()
-    match_clauses, match_params = [f"{_base_zone_expr()} = %s"], [zone]
-    if tier != "all":
-        match_clauses.append(f"COALESCE({tier_expr}, 0) = %s"); match_params.append(int(tier))
-    if solo != "any":
-        match_clauses.append(f"COALESCE({solo_expr}, false) = %s"); match_params.append(solo == "1")
-    match_where = " AND ".join(match_clauses)
+    match_where, match_params = _zone_window_where(game, zone, tier, solo)
 
     conn = db.get_connection()
     try:
@@ -2051,7 +2136,7 @@ def _compute_npc_combat_tiers(game, name):
 
 
 def _compute_npc_detail(game, name, tier="all"):
-    tier_expr, _ = _tier_solo_exprs()
+    tier_expr = _tier_expr()
     conn = db.get_connection()
     try:
         with conn.cursor() as cur:
@@ -2097,6 +2182,28 @@ def _compute_npc_detail(game, name, tier="all"):
                 (game, name),
             )
             con_stats = cur.fetchone()
+
+            # Total kills across every character/session, same "credit
+            # doesn't have to be yours" definition as the zone detail
+            # page's npc list and /characters' per-zone kills (target_type
+            # != 'you' excludes only the NPC killing *you*, not group/raid
+            # kills where a groupmate or pet landed the blow) -- NOT the
+            # combat_tiers table below, which deliberately restricts to
+            # source_type='you' because it pairs each kill with your own
+            # damage to estimate HP, and undercounts group kills as a
+            # result (see its own docstring/caption). Confirmed real
+            # (2026-09-22): Phinigel Autropos showed only 7 across
+            # combat_tiers -- all of them from days where "You" landed the
+            # kill -- while 16 more real deaths exist with the kill
+            # credited to a groupmate (source_type/target_type='unknown'),
+            # 23 total. Cheap: straight index hit on
+            # idx_game_type_target, no correlation involved.
+            cur.execute(
+                "SELECT COUNT(*) AS n FROM events ev JOIN games g ON ev.game_id=g.id "
+                "WHERE g.code=%s AND ev.event_type='death' AND ev.target_name=%s AND ev.target_type != 'you'",
+                (game, name),
+            )
+            total_kills = cur.fetchone()["n"]
 
             cur.execute(
                 "SELECT ev.target_name AS item, ev.amount AS qty, "
@@ -2144,6 +2251,7 @@ def _compute_npc_detail(game, name, tier="all"):
         "level_min": con_stats["level_min"],
         "level_max": con_stats["level_max"],
         "rare": bool(con_stats["rare"]),
+        "total_kills": total_kills,
         "combat_tiers": _compute_npc_combat_tiers(game, name),
         "vendor": is_vendor,
         "catalog": catalog,

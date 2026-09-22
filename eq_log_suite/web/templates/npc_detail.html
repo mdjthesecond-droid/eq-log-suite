@@ -8,6 +8,7 @@
   <strong>Type:</strong> {{ npc_type }}{% if npc_type == suggested_type %} <span style="opacity:0.6;">(auto-suggested)</span>{% endif %}
   {% if rare %}&middot; <strong>&#9733; rare</strong>{% endif %}
   {% if level_min is not none %}&middot; Lvl {{ level_min }}{% if level_max != level_min %}-{{ level_max }}{% endif %}{% endif %}
+  {% if total_kills %}&middot; <strong>Killed {{ total_kills }}x</strong>{% endif %}
 </p>
 <p><strong>Zones seen:</strong>
   {% for z in zones %}<a href="/zoneinfo/{{ game }}/detail?zone={{ z|urlencode }}">{{ z }}</a>{% if not loop.last %}, {% endif %}{% else %}none yet{% endfor %}
@@ -15,12 +16,14 @@
 
 {% if combat_tiers %}
 <h2>Combat</h2>
-<p style="opacity:0.7;">Estimated HP from your own damage between the previous kill (or zone
-entry) and each death -- not exact: pet/other-player damage isn't counted (so a group kill
-undercounts), and two same-named mobs up at once conflate into one window, which is why min/max
+<p style="opacity:0.7;">Per-tier HP estimated from your own damage between the previous kill (or
+zone entry) and each death, so the "kills" column below only counts deaths where <em>you</em>
+landed the blow -- it undercounts group kills on purpose (that's the {{ total_kills }} total
+above, group credit included) because a groupmate's or pet's damage can't be paired with a kill
+to estimate HP. Two same-named mobs up at once also conflate into one window, which is why min/max
 can spread wide for common trash names. Level range is from <code>con</code>.</p>
 <table class="sortable">
-  <thead><tr><th>tier</th><th>level range</th><th>kills</th><th>est. HP (min / avg / max)</th></tr></thead>
+  <thead><tr><th>tier</th><th>level range</th><th>your kills</th><th>est. HP (min / avg / max)</th></tr></thead>
   <tbody>
     {% for t in combat_tiers %}
     <tr>
