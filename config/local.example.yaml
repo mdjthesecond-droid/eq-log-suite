@@ -12,3 +12,11 @@ database:
 log_roots:
   eql: /home/myself/eql/Logs
   eq: /home/myself/eq/Logs
+
+# Which of the above the tailer actually watches/discovers -- normally just
+# whichever game you're currently playing. A game left out of this list is
+# left alone entirely, even if its folder doesn't exist (uninstalled, or a
+# broken Steam compatdata symlink) and even if it has log_sources rows
+# already marked live from a previous session.
+enabled_games:
+  - eql

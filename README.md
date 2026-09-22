@@ -154,9 +154,12 @@ automatically on boot -- nothing to launch for that.
 ## New/rotated log files (new character, new server)
 
 This is automatic -- nothing to do manually. The tailer scans the folders
-listed under `log_roots` in `config/local.yaml` once at startup and every 5
-minutes while it runs. Any file not already tracked gets imported and
-considered for live-tailing automatically (see `eq_log_suite/discovery.py`).
+listed under `log_roots` in `config/local.yaml`, restricted to whichever
+game codes are listed under `enabled_games` there (normally just whichever
+game you're currently playing), once at startup and every 5 minutes while
+it runs. A game left out of `enabled_games` is never touched -- its folder
+can be missing entirely -- and any files not already tracked get imported
+and considered for live-tailing automatically (see `eq_log_suite/discovery.py`).
 
 Only one file is kept "live" per character at a time, resolved by which of
 that character's known files has the most recent modification time -- i.e.

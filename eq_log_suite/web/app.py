@@ -3641,7 +3641,7 @@ def import_rescan(request: Request):
     from eq_log_suite import discovery
     from eq_log_suite.tailer import PID_PATH
 
-    log_roots = db.config().get("log_roots", {})
+    log_roots = db.enabled_log_roots()
     new_sources = discovery.scan_and_import(
         log_roots.get("eql", ""), log_roots.get("eq", "")
     )

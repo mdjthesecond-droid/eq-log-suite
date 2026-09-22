@@ -518,6 +518,18 @@ async def tail_log_source(conn, log_source, broadcaster: OverlayBroadcaster):
         f.close()
 
 
+async def _tail_log_source_isolated(conn, log_source, broadcaster: OverlayBroadcaster):
+    """Runs tail_log_source but keeps a crash (missing file, permission
+    error, whatever) local to this one source instead of taking down every
+    other game's tailing via asyncio.gather -- see the enabled_games check
+    in main_async for the normal way a defunct source is kept out of this
+    list entirely; this is the backstop for whatever still gets in."""
+    try:
+        await tail_log_source(conn, log_source, broadcaster)
+    except Exception as e:
+        print(f"[tailer] {log_source['file_path']} stopped: {type(e).__name__}: {e}")
+
+
 def _game_code_for(conn, game_id: int) -> str:
     with conn.cursor() as cur:
         cur.execute("SELECT code FROM games WHERE id=%s", (game_id,))
@@ -554,10 +566,15 @@ async def discovery_loop(eql_root, eq_root, broadcaster, running_log_source_ids,
             print(f"[tailer] discovered new log source: {log_source['file_path']}")
             running_log_source_ids.add(log_source["id"])
             task_conn = db.get_connection()
-            asyncio.create_task(tail_log_source(task_conn, log_source, broadcaster))
+            asyncio.create_task(_tail_log_source_isolated(task_conn, log_source, broadcaster))
 
 
-async def main_async(socket_path: str, eql_root: str | None, eq_root: str | None = None):
+async def main_async(
+    socket_path: str,
+    eql_root: str | None,
+    eq_root: str | None = None,
+    enabled_games: set[str] | None = None,
+):
     PID_PATH.parent.mkdir(parents=True, exist_ok=True)
     PID_PATH.write_text(str(os.getpid()))
 
@@ -570,7 +587,21 @@ async def main_async(socket_path: str, eql_root: str | None, eq_root: str | None
 
     conn = db.get_connection()
     with conn.cursor() as cur:
-        cur.execute("SELECT * FROM log_sources WHERE live=1")
+        # Restrict to enabled_games even though the row says live=1 -- a
+        # game that's uninstalled or just not being played shouldn't get
+        # tailed just because a stale row says so, and shouldn't need its
+        # folder to exist either (see [[project_tailer_no_db_reconnect]] and
+        # the FileNotFoundError incident this was added for: one dead game's
+        # missing log directory took down tailing for every other game too).
+        if enabled_games:
+            placeholders = ",".join(["%s"] * len(enabled_games))
+            cur.execute(
+                "SELECT ls.* FROM log_sources ls JOIN games g ON ls.game_id=g.id "
+                f"WHERE ls.live=1 AND g.code IN ({placeholders})",
+                tuple(enabled_games),
+            )
+        else:
+            cur.execute("SELECT * FROM log_sources WHERE live=1")
         live_sources = cur.fetchall()
     # This connection isn't reused for anything else -- each tail task below
     # gets its own -- so end its transaction and hand it back to the pool
@@ -596,7 +627,7 @@ async def main_async(socket_path: str, eql_root: str | None, eq_root: str | None
     tasks = []
     for log_source in live_sources:
         task_conn = db.get_connection()
-        tasks.append(asyncio.create_task(tail_log_source(task_conn, log_source, broadcaster)))
+        tasks.append(asyncio.create_task(_tail_log_source_isolated(task_conn, log_source, broadcaster)))
 
     if eql_root or eq_root:
         tasks.append(asyncio.create_task(
@@ -610,8 +641,10 @@ def main():
     ap = argparse.ArgumentParser(description="Live-tail all log_sources marked live=1.")
     ap.add_argument("--socket", default=DEFAULT_SOCKET_PATH)
     args = ap.parse_args()
-    log_roots = db.config().get("log_roots", {})
-    asyncio.run(main_async(args.socket, log_roots.get("eql"), log_roots.get("eq")))
+    enabled = db.enabled_games()
+    roots = db.enabled_log_roots()
+    print(f"[tailer] enabled games: {sorted(enabled)}")
+    asyncio.run(main_async(args.socket, roots.get("eql"), roots.get("eq"), enabled))
 
 
 if __name__ == "__main__":

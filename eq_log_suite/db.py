@@ -20,6 +20,26 @@ def config() -> dict:
         return yaml.safe_load(f)
 
 
+def enabled_games() -> set[str]:
+    """Game codes the tailer/discovery should actually touch, from config's
+    `enabled_games` list -- lets a game's log_roots entry (and any log_sources
+    rows already recorded for it) stay in place while uninstalled or just not
+    being played right now, without either being auto-discovered or crashing
+    the tailer when its folder doesn't exist. Defaults to every game with a
+    log_roots entry, so a config that predates this setting keeps tailing
+    everything it always did."""
+    cfg = config()
+    return set(cfg.get("enabled_games", cfg.get("log_roots", {}).keys()))
+
+
+def enabled_log_roots() -> dict[str, str]:
+    """log_roots filtered down to enabled_games -- the roots discovery/the
+    tailer should actually scan."""
+    roots = config().get("log_roots", {})
+    enabled = enabled_games()
+    return {code: path for code, path in roots.items() if code in enabled}
+
+
 @functools.lru_cache
 def _pool() -> PooledDB:
     # A real pool instead of a fresh pymysql.connect() (full TCP + auth
